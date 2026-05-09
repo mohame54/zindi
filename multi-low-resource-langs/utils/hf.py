@@ -19,6 +19,41 @@ def upload_file_paths_to_hf(pathes):
             repo_type="model",
         )
 
+
+def upload_folder_to_hf(
+    local_dir: str,
+    path_in_repo: str = "",
+    repo_id: str | None = None,
+    commit_message: str = "Upload model checkpoint",
+) -> str:
+    """Push an entire local directory to a HuggingFace Hub model repo.
+
+    Args:
+        local_dir: Local folder to upload (e.g. ``output_dir``).
+        path_in_repo: Sub-folder inside the HF repo (``""`` = repo root).
+        repo_id: HF repo id; falls back to ``HF_REPO_ID`` env var.
+        commit_message: Commit message shown in the HF repo history.
+
+    Returns:
+        The URL of the uploaded folder on HF Hub.
+    """
+    api = load_hf_api()
+    repo_id = repo_id or os.getenv("HF_REPO_ID")
+    if not repo_id:
+        raise ValueError(
+            "No HF repo id: pass repo_id or set the HF_REPO_ID environment variable."
+        )
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    url = api.upload_folder(
+        folder_path=local_dir,
+        path_in_repo=path_in_repo,
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=commit_message,
+    )
+    print(f"Model pushed to: {url}")
+    return url
+
 def download_checkpoint_from_hf(checkpoint_dir, local_dir, pathes):
     from huggingface_hub import hf_hub_download
     

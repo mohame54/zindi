@@ -4,43 +4,59 @@ from datasets import Dataset
 import json
 
 
+# Shared by student and teacher so the system-role tokens match; only the user message differs
+# (question-only vs question + reference). That reduces an extra distribution shift from different
+# system prefixes when DistilTrainer compares logits on the same completion.
 SYSTEM_PROMPT = (
-    "You are a helpful assistant. Use the provided reference answer to answer the user's question. "
-    "Do not repeat the reference answer word-for-word, but ensure all facts are correct. "
-    "Provide ONLY the answer text. No thinking, no intro, no outro."
+    "You are a helpful assistant. Follow the user's message. "
+    "If it includes a reference answer, use it to ground your response; do not copy it verbatim "
+    "when you can say the same thing more naturally. "
+    "Answer in the same language as the user's question. "
+    "Reply with ONLY the final answer text. No thinking, no intro, no outro."
 )
 
-
 TEACHER_TEMPLATE = """\
-Below is a question and a reference answer. Use the reference to write a final response.
+Question:
+{question}
 
-Question: {question}
+Reference answer (teacher context):
+{golden_answer}
 
-Reference Answer: {golden_answer}
-
-Instruction: Write the answer in {expected_lang}. Do not repeat the question or the reference headers.
-
-Answer:"""
+Write the final answer only, in the same language as the question."""
 
 
-def create_system_chains(
+def create_student_messages(question: str, system_prompt: str = SYSTEM_PROMPT) -> list[dict]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+
+
+def create_teacher_messages(
     question: str,
+    *,
+    golden_answer: str | None = None,
     system_prompt: str = SYSTEM_PROMPT,
     teacher_template: str = TEACHER_TEMPLATE,
-    golden_answer: str = None,
-    expected_lang: str = None
-):
-    if golden_answer is not None and expected_lang is not None:
-        return  [
-                {"role": "system",  "content": system_prompt},
-                {"role": "user",    "content": teacher_template.format(
-                    question=question, golden_answer=golden_answer, expected_lang=expected_lang
-                )},
-            ]
-    return [
-        {"role": "system",  "content": system_prompt},
-        {"role": "user",    "content": question},
+) -> list[dict]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+      
     ]
+    if golden_answer is not None:
+        messages.append({
+            "role": "user",
+            "content": teacher_template.format(
+                question=question,
+                golden_answer=golden_answer,
+            ),
+        })
+    else:
+        messages.append({
+            "role": "user",
+            "content": question,
+        })
+    return messages
 
 
 def load_hf_sdft_data_from_csv(
@@ -50,21 +66,40 @@ def load_hf_sdft_data_from_csv(
 ) -> pd.DataFrame:
     df = pd.read_csv(path)
     old_cols = df.columns.tolist()
-    df['expected_lang']  = df['subset'].str.split('_').str[0]
-    df['prompt'] = df['input'].apply(lambda x: create_system_chains(x, system_prompt, teacher_template))
+    df['expected_lang'] = df['subset'].str.split('_').str[0]
+
+    # SDFT: student prompt = question only; teacher_prompt = question + gold answer.
+    # Separate list objects so online patching of teacher_prompt never mutates prompt.
+    df['prompt'] = df.apply(
+        lambda r: create_student_messages(r['input'], system_prompt=system_prompt),
+        axis=1,
+    )
     df['teacher_prompt'] = df.apply(
-        lambda x: create_system_chains(
-            question=x['input'],
+        lambda r: create_teacher_messages(
+            r['input'],
+            golden_answer=r['output'],
             system_prompt=system_prompt,
             teacher_template=teacher_template,
-            golden_answer=x['output'],
-            expected_lang=x['expected_lang']
         ),
-        axis=1
+        axis=1,
     )
     df['answer'] = df['output']
     df.drop(columns=old_cols, inplace=True)
     return Dataset.from_pandas(df)
+
+
+def prepare_sft_dataset(dataset: Dataset, tokenizer, max_length: int = 1024) -> Dataset:
+    def _add_messages(sample: dict) -> dict:
+        sample["messages"] = sample["prompt"] + [
+            {"role": "assistant", "content": sample["answer"]},
+        ]
+        return sample
+    def length(messages):
+        return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
+    dataset = dataset.map(_add_messages)
+    dataset = dataset.map(lambda x: {"length": length(x['messages'])})
+    dataset = dataset.filter(lambda x: x["length"] <= max_length)
+    return dataset
 
 
 def load_json(fp:str) -> dict:

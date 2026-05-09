@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+from functools import partial
+from typing import Optional
 
 import torch
 
 from train import run_training
 from utils.data import SYSTEM_PROMPT, TEACHER_TEMPLATE, load_hf_sdft_data_from_csv
-from utils.hf import download_checkpoint_from_hf, upload_file_paths_to_hf
+from utils.hf import download_checkpoint_from_hf, upload_folder_to_hf
+from utils import rewards as reward_mod
 from langs import InferenceModel
 
 
@@ -24,11 +28,49 @@ def _json_dict(value: str) -> dict:
     return parsed
 
 
+def resolve_reward_funcs(names: list[str], lang_model: Optional[InferenceModel]) -> list:
+    """Map CLI reward names to callables for ``GRPOTrainer.reward_funcs``."""
+    resolved: list = []
+    for name in names:
+        if name == "rouge":
+            resolved.append(reward_mod.rouge_reward)
+        elif name == "lang":
+            if lang_model is None:
+                raise ValueError(
+                    "Reward 'lang' requires a language model; pass --lang_model_ckpt"
+                )
+            resolved.append(partial(reward_mod.lang_reward, lang_model=lang_model))
+        elif "." in name:
+            module_path, _, attr = name.rpartition(".")
+            mod = importlib.import_module(module_path)
+            resolved.append(getattr(mod, attr))
+        else:
+            raise ValueError(
+                f"Unknown reward {name!r}. Use rouge, lang, or a dotted path like mypkg.mod.my_fn"
+            )
+    return resolved
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Multilingual self-distillation (SDFT) training")
+    p = argparse.ArgumentParser(
+        description="Multilingual training: SDFT (DistilTrainer), GRPO (TRL), or SFT (transformers.Trainer)"
+    )
     p.add_argument("--model_name", default="Qwen/Qwen3.5-2B")
     p.add_argument("--dataset_path", required=True, help="CSV path for load_hf_sdft_data_from_csv")
     p.add_argument("--output_dir", required=True)
+    p.add_argument(
+        "--trainer-type",
+        choices=("sdft", "grpo", "sft"),
+        default="sdft",
+        help="sdft: DistilTrainer; grpo: GRPOTrainer (requires --reward-func); sft: supervised QA fine-tuning",
+    )
+    p.add_argument(
+        "--reward-func",
+        nargs="*",
+        default=None,
+        metavar="NAME",
+        help="GRPO only: one or more of rouge, lang, or dotted import paths (e.g. mymod.rewards.my_reward)",
+    )
 
     p.add_argument(
         "--lang_model_ckpt",
@@ -105,6 +147,12 @@ def parse_args():
     p.add_argument("--logging_steps", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,
+        help="Maximum number of checkpoints to keep on disk; oldest are deleted. Set to 0 to keep all.",
+    )
+    p.add_argument(
         "--save_every_n_epochs",
         type=int,
         default=0,
@@ -114,6 +162,42 @@ def parse_args():
     p.add_argument("--no_log_completions", action="store_true")
     p.add_argument("--num_loss_tokens_to_skip", type=int, default=3)
     p.add_argument("--no_shuffle_dataset", action="store_true")
+
+    # SFT QA (trainer-type=sft)
+    p.add_argument(
+        "--eval_dataset_path",
+        default=None,
+        help="Optional CSV for validation (same schema as --dataset_path); enables eval loss + ROUGE on eval split",
+    )
+    p.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=1024,
+        help="SFT: max tokens per example (prompt + answer) after truncation",
+    )
+    p.add_argument(
+        "--rouge_eval_steps",
+        type=int,
+        default=50,
+        help="SFT: run generation+ROUGE eval every N global steps",
+    )
+    p.add_argument(
+        "--rouge_eval_num_samples",
+        type=int,
+        default=100,
+        help="SFT: number of samples per ROUGE eval",
+    )
+    p.add_argument(
+        "--rouge_eval_max_new_tokens",
+        type=int,
+        default=256,
+        help="SFT: max new tokens when generating for ROUGE eval",
+    )
+    p.add_argument(
+        "--no_log_multilingual_rouge",
+        action="store_true",
+        help="SFT: disable per-language ROUGE breakdown (expected_lang)",
+    )
 
     # PEFT
     p.add_argument("--use_peft", action="store_true")
@@ -130,13 +214,21 @@ def parse_args():
     p.add_argument(
         "--teacher_template_file",
         default=None,
-        help="UTF-8 file whose contents replace TEACHER_TEMPLATE (must include {question}, {golden_answer}, {lang_hint})",
+        help="UTF-8 file whose contents replace TEACHER_TEMPLATE (must include {question} and {golden_answer})",
     )
 
     # HF Hub
     p.add_argument("--upload_to_hf", action="store_true")
     p.add_argument("--hf_checkpoint_dir", default=None)
     p.add_argument("--hf_local_dir", default="hf_checkpoint")
+    p.add_argument(
+        "--hf_repo_path",
+        default="",
+        help=(
+            "Sub-folder inside the HF repo to push to (default: repo root). "
+            "E.g. 'runs/sft-v1' will upload output_dir contents to that path."
+        ),
+    )
 
     return p.parse_args()
 
@@ -184,10 +276,27 @@ def main():
         teacher_template=teacher_template,
     )
 
+    eval_dataset = None
+    if args.eval_dataset_path:
+        eval_dataset = load_hf_sdft_data_from_csv(
+            args.eval_dataset_path,
+            system_prompt=system_prompt,
+            teacher_template=teacher_template,
+        )
+
+    need_lang_model = args.dynamic_lang_feedback or (
+        args.trainer_type == "grpo"
+        and args.reward_func
+        and "lang" in args.reward_func
+    )
+
     lang_model = None
-    if args.dynamic_lang_feedback:
+    if need_lang_model:
         if not args.lang_model_ckpt:
-            raise ValueError("--dynamic_lang_feedback requires --lang_model_ckpt")
+            raise ValueError(
+                "--lang_model_ckpt is required when using --dynamic_lang_feedback "
+                "or GRPO with the 'lang' reward"
+            )
         lang_model = InferenceModel.from_checkpoint(
             ckpt_path=args.lang_model_ckpt,
             tokenizer_path=args.lang_tokenizer,
@@ -199,10 +308,19 @@ def main():
     if not args.enable_thinking or args.disable_thinking:
         chat_template_kwargs["enable_thinking"] = False
 
+    reward_funcs = None
+    if args.trainer_type == "grpo":
+        if not args.reward_func:
+            raise ValueError("GRPO training requires at least one --reward-func (e.g. rouge or lang)")
+        reward_funcs = resolve_reward_funcs(args.reward_func, lang_model)
+
     run_training(
         model_name=model_name,
         train_dataset=dataset,
         output_dir=args.output_dir,
+        trainer_type=args.trainer_type,
+        eval_dataset=eval_dataset,
+        reward_funcs=reward_funcs,
         use_peft=args.use_peft,
         qlora=args.qlora,
         bnb_4bit_quant_type=args.bnb_4bit_quant_type,
@@ -237,20 +355,25 @@ def main():
         num_train_epochs=args.num_train_epochs,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit if args.save_total_limit > 0 else None,
         save_every_n_epochs=args.save_every_n_epochs,
         report_to=args.report_to,
         log_completions=log_completions,
         num_loss_tokens_to_skip=args.num_loss_tokens_to_skip,
         shuffle_dataset=shuffle_dataset,
+        max_seq_length=args.max_seq_length,
+        rouge_eval_steps=args.rouge_eval_steps,
+        rouge_eval_num_samples=args.rouge_eval_num_samples,
+        rouge_eval_max_new_tokens=args.rouge_eval_max_new_tokens,
+        log_multilingual_rouge=not args.no_log_multilingual_rouge,
     )
 
     if args.upload_to_hf:
-        ckpt_files = [
-            os.path.join(args.output_dir, f)
-            for f in os.listdir(args.output_dir)
-            if os.path.isfile(os.path.join(args.output_dir, f))
-        ]
-        upload_file_paths_to_hf(ckpt_files)
+        upload_folder_to_hf(
+            local_dir=args.output_dir,
+            path_in_repo=args.hf_repo_path,
+            commit_message=f"Upload checkpoint: {os.path.basename(args.output_dir)}",
+        )
 
 
 if __name__ == "__main__":

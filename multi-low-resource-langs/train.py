@@ -2,14 +2,19 @@ from __future__ import annotations
 import os
 import sys
 import math
+import warnings
 import torch
 from collections import defaultdict
-from typing import Any, Optional
+from dataclasses import fields
+from typing import Any, Optional, Union
 from accelerate.utils import gather_object
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback
+from trl import GRPOConfig, GRPOTrainer
 from utils.peft import load_lora_model, load_qlora_model
 from utils.metrics import calculate_rouge_score
-from utils.data import tokenize_dataset_stats
+from utils.data import prepare_sft_dataset, tokenize_dataset_stats
+from trainers.grpo import LangAwareGRPOTrainer
+from trainers.sft import SFTQAConfig, SFTQATrainer
 # Local SDFT trainer (add trainers/sdft to path)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "trainers", "sdft"))
 from sdft import DistilTrainer
@@ -20,7 +25,7 @@ from langs import InferenceModel
 def _add_feedback_to_teacher_prompt(teacher_prompt: list[dict], feedback: str) -> list[dict]:
     patched_prompt = [dict(msg) for msg in teacher_prompt]
     for msg in reversed(patched_prompt):
-        if msg["role"] == "user":
+        if msg["role"] == "system":
             msg["content"] = msg["content"] + feedback
             break
     return patched_prompt
@@ -119,7 +124,6 @@ class LangAwareDistilTrainer(DistilTrainer):
         if n_total > 0:
             prefix = f"{'eval_' if mode == 'eval' else ''}lang_drift"
             self._lang_stats[f"{prefix}/mismatch_count"].append(n_mismatch)
-            self._lang_stats[f"{prefix}/total_count"].append(n_total)
             self._lang_stats[f"{prefix}/mismatch_rate"].append(n_mismatch / n_total)
             for lang, count in per_expected.items():
                 self._lang_stats[f"{prefix}/expected/{lang}"].append(count)
@@ -226,6 +230,7 @@ def run_training(
     num_train_epochs: int = 1,
     logging_steps: int = 1,
     save_steps: int = 200,
+    save_total_limit: Optional[int] = 3,
     save_every_n_epochs: int = 0,
     report_to: str = "wandb",
     log_completions: bool = True,
@@ -233,7 +238,17 @@ def run_training(
     shuffle_dataset: bool = True,
     # Callbacks
     extra_callbacks: Optional[list] = None,
-) -> DistilTrainer:
+    # Trainer backend
+    trainer_type: str = "sdft",
+    reward_funcs: Optional[list] = None,
+    # SFT QA (trainer_type="sft")
+    eval_dataset: Optional[Any] = None,
+    max_seq_length: int = 2048,
+    rouge_eval_steps: int = 50,
+    rouge_eval_num_samples: int = 50,
+    rouge_eval_max_new_tokens: int = 256,
+    log_multilingual_rouge: bool = True,
+) -> Union[DistilTrainer, GRPOTrainer, Trainer]:
     """
     Build DistilConfig, attach optional epoch-save callback, run trainer.train().
 
@@ -241,12 +256,33 @@ def run_training(
     bfloat16; student uses LoRA/QLoRA per flags). ``peft_config`` is ignored when
     student is passed explicitly unless you also pass a pre-built student that
     is already a PeftModel — prefer passing ``student=None`` and using use_peft/qlora.
+
+    ``trainer_type="grpo"`` uses TRL's ``GRPOTrainer``; pass non-empty ``reward_funcs``
+    and set ``num_generations >= 2`` (enforced by TRL).
+
+    ``trainer_type="sft"`` uses ``SFTQATrainer`` (``transformers.Trainer``) with label
+    masking on the prompt; pass ``eval_dataset`` for validation loss and ROUGE on the
+    eval split (optional CSV loaded in ``main.py`` via ``--eval_dataset_path``).
     """
     if qlora:
         use_peft = True
 
+    if trainer_type not in ("sdft", "grpo", "sft"):
+        raise ValueError(
+            f"trainer_type must be 'sdft', 'grpo', or 'sft', got {trainer_type!r}"
+        )
+
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    if trainer_type == "grpo":
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    elif trainer_type == "sft":
+        tokenizer.padding_side = "right"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
     # Display token-length statistics for the training data before loading models.
     # The processed dataset stores the question inside the prompt message chain and
@@ -266,10 +302,13 @@ def run_training(
         answer_col="output",
     )
 
-    if teacher is None:
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
-        )
+    if trainer_type == "sdft":
+        if teacher is None:
+            teacher = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16
+            )
+    else:
+        teacher = None
 
     if student is None:
         if qlora:
@@ -288,65 +327,175 @@ def run_training(
             )
             peft_config = None
 
-    config = DistilConfig(
-        output_dir=output_dir,
-        seed=seed,
-        learning_rate=learning_rate,
-        warmup_ratio=warmup_ratio,
-        lr_scheduler_type=lr_scheduler_type,
-        bf16=bf16,
-        fp16=fp16,
-        max_grad_norm=max_grad_norm,
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_generations=num_generations,
-        num_iterations=num_iterations,
-        max_prompt_length=max_prompt_length,
-        max_completion_length=max_completion_length,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
-        generation_kwargs=generation_kwargs,
-        chat_template_kwargs=chat_template_kwargs,
-        alpha=alpha,
-        beta=beta,
-        generate_from_teacher=generate_from_teacher,
-        sync_ref_model=sync_ref_model,
-        ref_model_sync_steps=ref_model_sync_steps,
-        ref_model_mixup_alpha=ref_model_mixup_alpha,
-        num_train_epochs=num_train_epochs,
-        logging_steps=logging_steps,
-        save_steps=save_steps,
-        report_to=report_to,
-        log_completions=log_completions,
-        num_loss_tokens_to_skip=num_loss_tokens_to_skip,
-        shuffle_dataset=shuffle_dataset,
-    )
-
     callbacks: list = list(extra_callbacks or [])
     epoch_cb: Optional[SaveEveryNEpochsCallback] = None
     if save_every_n_epochs > 0:
         epoch_cb = SaveEveryNEpochsCallback(save_every_n_epochs)
         callbacks.append(epoch_cb)
 
-    TrainerClass = LangAwareDistilTrainer if dynamic_lang_feedback else DistilTrainer
-    trainer_kwargs: dict[str, Any] = dict(
-        model=student,
-        ref_model=teacher,
-        args=config,
-        train_dataset=train_dataset,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-        callbacks=callbacks if callbacks else None,
-        rouge_score_threshold=rouge_score_threshold,
-    )
-    if dynamic_lang_feedback:
-        if lang_model is None:
-            raise ValueError("dynamic_lang_feedback=True requires lang_model")
-        trainer_kwargs["lang_model"] = lang_model
+    if trainer_type == "grpo":
+        if not reward_funcs:
+            raise ValueError('trainer_type="grpo" requires a non-empty reward_funcs list')
+        ng = num_generations
+        if ng is not None and ng < 2:
+            warnings.warn(
+                f"GRPO requires num_generations >= 2 (got {ng}); using 2.",
+                stacklevel=2,
+            )
+            ng = 2
+        grpo_field_names = {f.name for f in fields(GRPOConfig)}
+        grpo_kwargs: dict[str, Any] = {
+            "output_dir": output_dir,
+            "seed": seed,
+            "learning_rate": learning_rate,
+            "warmup_ratio": warmup_ratio,
+            "lr_scheduler_type": lr_scheduler_type,
+            "bf16": bf16,
+            "fp16": fp16,
+            "max_grad_norm": max_grad_norm,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "num_generations": ng,
+            "num_iterations": num_iterations,
+            "max_completion_length": max_completion_length,
+            "temperature": temperature,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "generation_kwargs": generation_kwargs,
+            "chat_template_kwargs": chat_template_kwargs,
+            "beta": beta,
+            "sync_ref_model": sync_ref_model,
+            "ref_model_sync_steps": ref_model_sync_steps,
+            "ref_model_mixup_alpha": ref_model_mixup_alpha,
+            "num_train_epochs": num_train_epochs,
+            "logging_steps": logging_steps,
+            "save_steps": save_steps,
+            "save_total_limit": save_total_limit,
+            "report_to": report_to,
+            "log_completions": log_completions,
+            "shuffle_dataset": shuffle_dataset,
+            "remove_unused_columns": False,
+        }
+        if top_k is not None:
+            grpo_kwargs["top_k"] = top_k
+        if "max_prompt_length" in grpo_field_names:
+            grpo_kwargs["max_prompt_length"] = max_prompt_length
+        if "num_loss_tokens_to_skip" in grpo_field_names:
+            grpo_kwargs["num_loss_tokens_to_skip"] = num_loss_tokens_to_skip
+        grpo_config = GRPOConfig(
+            **{k: v for k, v in grpo_kwargs.items() if k in grpo_field_names}
+        )
+        TrainerClass = LangAwareGRPOTrainer if dynamic_lang_feedback else GRPOTrainer
+        trainer_kwargs = dict(
+            model=student,
+            reward_funcs=reward_funcs,
+            args=grpo_config,
+            train_dataset=train_dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=callbacks if callbacks else None,
+        )
+        if dynamic_lang_feedback:
+            if lang_model is None:
+                raise ValueError("dynamic_lang_feedback=True requires lang_model")
+            trainer_kwargs["lang_model"] = lang_model
+            trainer_kwargs["rouge_score_threshold"] = rouge_score_threshold
+        trainer = TrainerClass(**trainer_kwargs)
+    elif trainer_type == "sft":
+        sft_train = prepare_sft_dataset(train_dataset, tokenizer)
+        sft_eval = (
+            prepare_sft_dataset(eval_dataset, tokenizer) if eval_dataset is not None else None
+        )
+        sft_config = SFTQAConfig(
+            output_dir=output_dir,
+            seed=seed,
+            learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+            lr_scheduler_type=lr_scheduler_type,
+            bf16=bf16,
+            fp16=fp16,
+            max_grad_norm=max_grad_norm,
+            per_device_train_batch_size=per_device_train_batch_size,
+            per_device_eval_batch_size=per_device_train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            num_train_epochs=num_train_epochs,
+            logging_steps=logging_steps,
+            save_steps=save_steps,
+            save_total_limit=save_total_limit,
+            report_to=report_to,
+            remove_unused_columns=False,
+            max_length=max_seq_length,
+            rouge_eval_steps=rouge_eval_steps,
+            rouge_eval_num_samples=rouge_eval_num_samples,
+            rouge_eval_max_new_tokens=rouge_eval_max_new_tokens,
+            log_multilingual_rouge=log_multilingual_rouge,
+            eval_strategy="steps" if sft_eval is not None else "no",
+            eval_steps=save_steps if sft_eval is not None else None,
+        )
+        trainer = SFTQATrainer(
+            model=student,
+            args=sft_config,
+            train_dataset=sft_train,
+            eval_dataset=sft_eval,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=callbacks if callbacks else None,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    else:
+        config = DistilConfig(
+            output_dir=output_dir,
+            seed=seed,
+            learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+            lr_scheduler_type=lr_scheduler_type,
+            bf16=bf16,
+            fp16=fp16,
+            max_grad_norm=max_grad_norm,
+            per_device_train_batch_size=per_device_train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            num_generations=num_generations,
+            num_iterations=num_iterations,
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            generation_kwargs=generation_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
+            alpha=alpha,
+            beta=beta,
+            generate_from_teacher=generate_from_teacher,
+            sync_ref_model=sync_ref_model,
+            ref_model_sync_steps=ref_model_sync_steps,
+            ref_model_mixup_alpha=ref_model_mixup_alpha,
+            num_train_epochs=num_train_epochs,
+            logging_steps=logging_steps,
+            save_steps=save_steps,
+            save_total_limit=save_total_limit,
+            report_to=report_to,
+            log_completions=log_completions,
+            num_loss_tokens_to_skip=num_loss_tokens_to_skip,
+            shuffle_dataset=shuffle_dataset,
+        )
+        TrainerClass = LangAwareDistilTrainer if dynamic_lang_feedback else DistilTrainer
+        trainer_kwargs = dict(
+            model=student,
+            ref_model=teacher,
+            args=config,
+            train_dataset=train_dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=callbacks if callbacks else None,
+            rouge_score_threshold=rouge_score_threshold,
+        )
+        if dynamic_lang_feedback:
+            if lang_model is None:
+                raise ValueError("dynamic_lang_feedback=True requires lang_model")
+            trainer_kwargs["lang_model"] = lang_model
 
-    trainer = TrainerClass(**trainer_kwargs)
+        trainer = TrainerClass(**trainer_kwargs)
     if epoch_cb is not None:
         epoch_cb.set_trainer(trainer)
 
