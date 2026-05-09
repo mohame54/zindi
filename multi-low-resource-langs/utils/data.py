@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from datasets import Dataset
 import json
@@ -69,3 +70,80 @@ def load_hf_sdft_data_from_csv(
 def load_json(fp:str) -> dict:
     with open(fp, 'r') as f:
         return json.load(f)
+
+
+def tokenize_dataset_stats(
+    data,
+    tokenizer,
+    question_col: str = "input",
+    answer_col: str = "output",
+    print_report: bool = True,
+) -> dict:
+    """Tokenize every question and answer in the dataset and return length statistics.
+
+    Args:
+        data: CSV file path, dict of lists, pandas DataFrame, or HuggingFace Dataset.
+              Must contain `question_col` and `answer_col` columns.
+        tokenizer: Any tokenizer with an ``encode`` method (e.g. a HuggingFace tokenizer).
+        question_col: Column name for the question / input text.
+        answer_col: Column name for the reference answer / output text.
+        print_report: If True, print a human-readable summary to stdout.
+
+    Returns:
+        A dict with keys ``"questions"`` and ``"answers"``, each holding a stats sub-dict
+        with keys: count, min, max, mean, median, p90, p95, p99, total_tokens.
+    """
+    if isinstance(data, str):
+        df = pd.read_csv(data)
+    elif isinstance(data, dict):
+        df = pd.DataFrame(data)
+    elif isinstance(data, pd.DataFrame):
+        df = data
+    else:
+        df = data.to_pandas()
+
+    def _lengths(col):
+        return [
+            len(tokenizer.encode(str(text), add_special_tokens=False))
+            for text in df[col]
+        ]
+
+    def _stats(lengths: list) -> dict:
+        arr = np.array(lengths, dtype=np.int64)
+        return {
+            "count":        int(len(arr)),
+            "min":          int(arr.min()),
+            "max":          int(arr.max()),
+            "mean":         round(float(arr.mean()), 2),
+            "median":       round(float(np.median(arr)), 2),
+            "p90":          round(float(np.percentile(arr, 90)), 2),
+            "p95":          round(float(np.percentile(arr, 95)), 2),
+            "p99":          round(float(np.percentile(arr, 99)), 2),
+            "total_tokens": int(arr.sum()),
+        }
+
+    q_stats = _stats(_lengths(question_col))
+    a_stats = _stats(_lengths(answer_col))
+    report = {"questions": q_stats, "answers": a_stats}
+
+    if print_report:
+        _print_stats_report(report, question_col, answer_col)
+
+    return report
+
+
+def _print_stats_report(report: dict, question_col: str, answer_col: str) -> None:
+    col_width = 14
+    header = f"{'Stat':<{col_width}} {'Questions':>{col_width}} {'Answers':>{col_width}}"
+    separator = "-" * len(header)
+    rows = ["count", "min", "max", "mean", "median", "p90", "p95", "p99", "total_tokens"]
+
+    print(f"\n=== Token-length statistics  ({question_col!r} / {answer_col!r}) ===")
+    print(separator)
+    print(header)
+    print(separator)
+    for row in rows:
+        q_val = report["questions"][row]
+        a_val = report["answers"][row]
+        print(f"{row:<{col_width}} {str(q_val):>{col_width}} {str(a_val):>{col_width}}")
+    print(separator)

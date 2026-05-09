@@ -5,9 +5,11 @@ import math
 import torch
 from collections import defaultdict
 from typing import Any, Optional
+from accelerate.utils import gather_object
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from utils.peft import load_lora_model, load_qlora_model
 from utils.metrics import calculate_rouge_score
+from utils.data import tokenize_dataset_stats
 # Local SDFT trainer (add trainers/sdft to path)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "trainers", "sdft"))
 from sdft import DistilTrainer
@@ -78,6 +80,7 @@ class LangAwareDistilTrainer(DistilTrainer):
         per_detected: dict[str, int] = defaultdict(int)
 
         patched_inputs = []
+        rouge_scores_per_sample: list[float] = []
         rouge_prefix = f"{'eval_' if mode == 'eval' else ''}rouge"
         for sample, detected, generated in zip(inputs, detected_langs, completion_texts):
             expected = sample.get("expected_lang")
@@ -86,6 +89,7 @@ class LangAwareDistilTrainer(DistilTrainer):
             patched = dict(sample)
             for metric_name, metric_value in rouge_scores.items():
                 self.rouge_stats[f"{rouge_prefix}/{metric_name}"].append(metric_value)
+            rouge_scores_per_sample.append(rouge_scores["score"])
             if expected:
                 n_total += 1
                 if detected != expected:
@@ -122,7 +126,14 @@ class LangAwareDistilTrainer(DistilTrainer):
             for lang, count in per_detected.items():
                 self._lang_stats[f"{prefix}/detected/{lang}"].append(count)
 
-        return super()._generate_and_score_completions(patched_inputs)
+        result = super()._generate_and_score_completions(patched_inputs)
+
+        # Replace the placeholder "main" zeros with actual ROUGE scores so that
+        # the rich table and W&B completions table show a meaningful reward column.
+        self._logs["rewards"].pop("main", None)
+        self._logs["rewards"]["rouge"].extend(gather_object(rouge_scores_per_sample))
+
+        return result
 
     def log(self, logs: dict, start_time=None) -> None:
         # Fold accumulated lang-drift stats into logs as averages, then clear.
@@ -236,6 +247,24 @@ def run_training(
 
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Display token-length statistics for the training data before loading models.
+    # The processed dataset stores the question inside the prompt message chain and
+    # the golden answer in the "answer" column; we pull both as plain text here.
+    _questions = [
+        next(
+            (m["content"] for m in sample["prompt"] if m["role"] == "user"),
+            "",
+        )
+        for sample in train_dataset
+    ]
+    _answers = [sample["answer"] for sample in train_dataset]
+    tokenize_dataset_stats(
+        {"input": _questions, "output": _answers},
+        tokenizer,
+        question_col="input",
+        answer_col="output",
+    )
 
     if teacher is None:
         teacher = AutoModelForCausalLM.from_pretrained(
