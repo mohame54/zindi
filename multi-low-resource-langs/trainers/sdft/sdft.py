@@ -30,8 +30,15 @@ from transformers.utils import is_datasets_available, is_flash_attn_2_available,
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, prepare_multimodal_messages
 from trl.extras.profiling import profiling_context, profiling_decorator
-from trl.models import prepare_deepspeed, prepare_fsdp, prepare_peft_model, unwrap_model_for_generation
-from trl.trainer.base_trainer import BaseTrainer
+from trl.models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
+try:
+    from trl.models import prepare_peft_model
+except ImportError:
+    from trl.experimental.utils import prepare_peft_model
+try:
+    from trl.trainer.base_trainer import BaseTrainer
+except ImportError:
+    from trl.trainer.base_trainer import _BaseTrainer as BaseTrainer
 from config import DistilConfig
 from accelerate.state import AcceleratorState
 from trl.trainer.utils import (

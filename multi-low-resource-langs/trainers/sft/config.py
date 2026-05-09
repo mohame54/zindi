@@ -25,4 +25,5 @@ class SFTQAConfig(SFTConfig):
     rouge_eval_steps: int = 50
     rouge_eval_num_samples: int = 50
     rouge_eval_max_new_tokens: int = 256
+    rouge_eval_batch_size: int = 8
     log_multilingual_rouge: bool = True

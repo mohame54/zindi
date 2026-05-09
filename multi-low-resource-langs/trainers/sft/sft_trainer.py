@@ -1,5 +1,3 @@
-"""Supervised fine-tuning Trainer with ROUGE + per-language logging."""
-
 from __future__ import annotations
 
 import random
@@ -49,6 +47,7 @@ class RougeEvalCallback(TrainerCallback):
         rouge_eval_num_samples: int,
         rouge_eval_max_new_tokens: int,
         log_multilingual_rouge: bool,
+        rouge_eval_batch_size: int = 8,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.processing_class = processing_class
@@ -56,6 +55,7 @@ class RougeEvalCallback(TrainerCallback):
         self.rouge_eval_steps = rouge_eval_steps
         self.rouge_eval_num_samples = rouge_eval_num_samples
         self.rouge_eval_max_new_tokens = rouge_eval_max_new_tokens
+        self.rouge_eval_batch_size = rouge_eval_batch_size
         self.log_multilingual_rouge = log_multilingual_rouge
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.trainer: Optional[SFTTrainer] = None
@@ -91,44 +91,66 @@ class RougeEvalCallback(TrainerCallback):
         sum_score = 0.0
         per_lang_scores: dict[str, list[dict[str, float]]] = defaultdict(list)
 
-        with torch.no_grad():
-            for idx in indices:
-                row = ds[idx]
-                prompt = row["prompt"]
-                answer = row.get("answer") or ""
-                exp_lang = row.get("expected_lang")
+        rows = [ds[idx] for idx in indices]
+        batch_size = max(1, self.rouge_eval_batch_size)
 
-                prompt_ids = tok.apply_chat_template(
-                    prompt,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    **self.chat_template_kwargs,
-                )
-                input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                attn = torch.ones_like(input_ids)
+        with torch.no_grad():
+            for batch_start in range(0, k, batch_size):
+                batch_rows = rows[batch_start : batch_start + batch_size]
+
+                batch_prompt_ids = [
+                    tok.apply_chat_template(
+                        row["prompt"],
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_dict=False,
+                        **self.chat_template_kwargs,
+                    )
+                    for row in batch_rows
+                ]
+
+                # Left-pad all prompts to the same length for batched generation
+                max_prompt_len = max(len(ids) for ids in batch_prompt_ids)
+                padded_ids = [
+                    [pad_id] * (max_prompt_len - len(ids)) + ids
+                    for ids in batch_prompt_ids
+                ]
+                attn_masks = [
+                    [0] * (max_prompt_len - len(ids)) + [1] * len(ids)
+                    for ids in batch_prompt_ids
+                ]
+
+                input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
+                attn = torch.tensor(attn_masks, dtype=torch.long, device=device)
+
                 gen_out = model.generate(
                     input_ids,
                     attention_mask=attn,
                     max_new_tokens=self.rouge_eval_max_new_tokens,
                     pad_token_id=pad_id,
                     do_sample=False,
+                    repetition_penalty=1.1,
                 )
-                new_tokens = gen_out[0, input_ids.shape[1] :]
-                pred = tok.decode(new_tokens, skip_special_tokens=True).strip()
 
-                scores = calculate_rouge_score(str(answer), pred)
-                sum_r1 += float(scores["rouge1_f1"])
-                sum_rl += float(scores["rougeL_f1"])
-                sum_score += float(scores["score"])
+                for i, row in enumerate(batch_rows):
+                    answer = row.get("answer") or ""
+                    exp_lang = row.get("expected_lang")
+                    new_tokens = gen_out[i, max_prompt_len:]
+                    pred = tok.decode(new_tokens, skip_special_tokens=True).strip()
 
-                if self.log_multilingual_rouge and exp_lang and str(exp_lang).strip():
-                    per_lang_scores[str(exp_lang)].append(
-                        {
-                            "rouge1_f1": float(scores["rouge1_f1"]),
-                            "rougeL_f1": float(scores["rougeL_f1"]),
-                            "score": float(scores["score"]),
-                        }
-                    )
+                    scores = calculate_rouge_score(str(answer), pred)
+                    sum_r1 += float(scores["rouge1_f1"])
+                    sum_rl += float(scores["rougeL_f1"])
+                    sum_score += float(scores["score"])
+
+                    if self.log_multilingual_rouge and exp_lang and str(exp_lang).strip():
+                        per_lang_scores[str(exp_lang)].append(
+                            {
+                                "rouge1_f1": float(scores["rouge1_f1"]),
+                                "rougeL_f1": float(scores["rougeL_f1"]),
+                                "score": float(scores["score"]),
+                            }
+                        )
 
         if was_training:
             model.train()
@@ -214,6 +236,7 @@ class SFTQATrainer(SFTTrainer):
             rouge_eval_steps=args.rouge_eval_steps,
             rouge_eval_num_samples=args.rouge_eval_num_samples,
             rouge_eval_max_new_tokens=args.rouge_eval_max_new_tokens,
+            rouge_eval_batch_size=args.rouge_eval_batch_size,
             log_multilingual_rouge=args.log_multilingual_rouge,
             chat_template_kwargs=chat_template_kwargs,
         )

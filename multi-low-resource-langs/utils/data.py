@@ -99,7 +99,7 @@ def prepare_sft_dataset(dataset: Dataset, tokenizer, max_length: int = 1024) -> 
         ]
         return sample
     def length(messages):
-        return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
+        return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=False))
     dataset = dataset.map(_add_messages)
     dataset = dataset.map(lambda x: {"length": length(x['messages'])})
     dataset = dataset.filter(lambda x: x["length"] <= max_length)

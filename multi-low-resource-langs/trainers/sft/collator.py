@@ -8,12 +8,6 @@ import torch
 
 
 class SFTQACollator:
-    """Apply chat template, mask prompt tokens in labels, pad to ``max_seq_length``.
-
-    Uses ``processing_class`` (tokenizer) to build sequences so it works with any
-    model's chat template without needing a hard-coded response template string.
-    """
-
     def __init__(
         self,
         processing_class: Any,
@@ -38,12 +32,14 @@ class SFTQACollator:
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
+                return_dict=False,
                 **self.chat_template_kwargs,
             )
             prompt_ids = self.processing_class.apply_chat_template(
                 prompt,
                 tokenize=True,
                 add_generation_prompt=True,
+                return_dict=False,
                 **self.chat_template_kwargs,
             )
 

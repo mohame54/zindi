@@ -247,6 +247,7 @@ def run_training(
     rouge_eval_steps: int = 50,
     rouge_eval_num_samples: int = 50,
     rouge_eval_max_new_tokens: int = 256,
+    rouge_eval_batch_size: int = 8,
     log_multilingual_rouge: bool = True,
 ) -> Union[DistilTrainer, GRPOTrainer, Trainer]:
     """
@@ -402,9 +403,9 @@ def run_training(
             trainer_kwargs["rouge_score_threshold"] = rouge_score_threshold
         trainer = TrainerClass(**trainer_kwargs)
     elif trainer_type == "sft":
-        sft_train = prepare_sft_dataset(train_dataset, tokenizer)
+        sft_train = prepare_sft_dataset(train_dataset, tokenizer,max_length=max_seq_length)
         sft_eval = (
-            prepare_sft_dataset(eval_dataset, tokenizer) if eval_dataset is not None else None
+            prepare_sft_dataset(eval_dataset, tokenizer, max_length=max_seq_length) if eval_dataset is not None else None
         )
         sft_config = SFTQAConfig(
             output_dir=output_dir,
@@ -428,6 +429,7 @@ def run_training(
             rouge_eval_steps=rouge_eval_steps,
             rouge_eval_num_samples=rouge_eval_num_samples,
             rouge_eval_max_new_tokens=rouge_eval_max_new_tokens,
+            rouge_eval_batch_size=rouge_eval_batch_size,
             log_multilingual_rouge=log_multilingual_rouge,
             eval_strategy="steps" if sft_eval is not None else "no",
             eval_steps=save_steps if sft_eval is not None else None,

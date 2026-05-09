@@ -194,6 +194,12 @@ def parse_args():
         help="SFT: max new tokens when generating for ROUGE eval",
     )
     p.add_argument(
+        "--rouge_eval_batch_size",
+        type=int,
+        default=8,
+        help="SFT: number of prompts to generate in parallel during ROUGE eval",
+    )
+    p.add_argument(
         "--no_log_multilingual_rouge",
         action="store_true",
         help="SFT: disable per-language ROUGE breakdown (expected_lang)",
@@ -366,6 +372,7 @@ def main():
         rouge_eval_steps=args.rouge_eval_steps,
         rouge_eval_num_samples=args.rouge_eval_num_samples,
         rouge_eval_max_new_tokens=args.rouge_eval_max_new_tokens,
+        rouge_eval_batch_size=args.rouge_eval_batch_size,
         log_multilingual_rouge=not args.no_log_multilingual_rouge,
     )
 
