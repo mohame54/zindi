@@ -116,7 +116,7 @@ def parse_args():
     p.add_argument("--no_shuffle_dataset", action="store_true")
 
     # PEFT
-    p.add_argument("--use_peft", action="store_false")
+    p.add_argument("--use_peft", action="store_true")
     p.add_argument("--qlora", action="store_true", help="4-bit QLoRA student; implies --use_peft")
     p.add_argument("--bnb_4bit_quant_type", default="nf4", choices=["nf4", "fp4"])
     p.add_argument("--no_double_quant", action="store_true", help="Disable BnB double quant for QLoRA")
