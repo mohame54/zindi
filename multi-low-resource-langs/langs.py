@@ -68,6 +68,7 @@ class InferenceModel:
         self.max_len = model.max_len
         self.compiled = False
         self.constant_bz = None
+        self.device = next(model.parameters()).device
 
     def to(self, device):
         self.model.to(device)
@@ -107,7 +108,9 @@ class InferenceModel:
         m    = TransformerClassifier(**cfg).to(device)
         m.load_state_dict(ckpt['model_state'])
         m.eval()
-        return cls(m, tok, ckpt['label2idx'])
+        inst =  cls(m, tok, ckpt['label2idx'])
+        inst.device = device
+        return inst
     
     def encode(self, texts):
         input_ids, attn_masks = [], []
