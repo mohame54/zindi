@@ -338,13 +338,15 @@ class DistilTrainer(BaseTrainer):
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
 
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in GRPO-like algorithms, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
-        # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
-        # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
-        # This acts as a flag to indicate that the warning has already been issued.
-        model.warnings_issued["estimate_tokens"] = True
+        # Suppress the "Could not estimate the number of tokens" FLOPs warning that transformers emits
+        # when "input_ids" is absent from the batch (as is the case in GRPO-style trainers).
+        # Accessing warnings_issued through a PeftModel proxy fails in transformers>=5.0, so we
+        # unwrap to the real base model first and silently ignore if the attribute no longer exists.
+        try:
+            _base = model.base_model.model if is_peft_model(model) else model
+            _base.warnings_issued["estimate_tokens"] = True
+        except (AttributeError, TypeError):
+            pass
 
         super().__init__(
             model=model,

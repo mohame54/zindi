@@ -3,6 +3,8 @@ from peft import LoraConfig, get_peft_model
 import json
 import os
 
+_DEFAULT_PEFT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "peft_config.json")
+
 
 def load_json(fp:str) -> dict:
     with open(fp, 'r') as f:
@@ -39,8 +41,7 @@ def make_peft_model(
     model,
     logs=True,
 ):
-    peft_config_file = os.path.join(os.path.dirname(__file__), "configs", "peft_config.json")
-    peft_config = load_json(peft_config_file)
+    peft_config = load_json(_DEFAULT_PEFT_CONFIG)
     config = LoraConfig(**peft_config)
     lora_model = get_peft_model(model, config)
     if logs:
@@ -60,8 +61,7 @@ def load_lora_model(
     which handles FSDP / DeepSpeed setup correctly.
     """
     from transformers import AutoModelForCausalLM
-    peft_config_file = os.path.join(os.path.dirname(__file__), "configs", "peft_config.json")
-    peft_config = load_json(peft_config_file)
+    peft_config = load_json(_DEFAULT_PEFT_CONFIG)
     dt = torch.bfloat16 if check_bfloat16_support() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dt)
     lora_config = LoraConfig(**peft_config)
@@ -107,8 +107,7 @@ def load_qlora_model(
         model_name, quantization_config=bnb_config, device_map=_device_map
     )
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-    peft_config_file = os.path.join(os.path.dirname(__file__), "configs", "peft_config.json")
-    peft_config = load_json(peft_config_file)
+    peft_config = load_json(_DEFAULT_PEFT_CONFIG)
     lora_config = LoraConfig(**peft_config)
     if logs:
         print(
