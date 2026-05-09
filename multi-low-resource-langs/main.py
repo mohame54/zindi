@@ -282,6 +282,7 @@ def main():
             args.eval_dataset_path,
             system_prompt=system_prompt,
             teacher_template=teacher_template,
+            train=False,
         )
 
     need_lang_model = args.dynamic_lang_feedback or (

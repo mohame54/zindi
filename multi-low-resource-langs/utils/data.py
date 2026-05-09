@@ -63,6 +63,7 @@ def load_hf_sdft_data_from_csv(
     path: str,
     system_prompt: str = SYSTEM_PROMPT,
     teacher_template: str = TEACHER_TEMPLATE,
+    train: bool = True,
 ) -> pd.DataFrame:
     df = pd.read_csv(path)
     old_cols = df.columns.tolist()
@@ -84,6 +85,8 @@ def load_hf_sdft_data_from_csv(
         axis=1,
     )
     df['answer'] = df['output']
+    if train:
+        df.drop([2814, 2929, 19431], inplace=True)
     df.drop(columns=old_cols, inplace=True)
     return Dataset.from_pandas(df)
 
