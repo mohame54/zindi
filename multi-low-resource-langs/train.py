@@ -15,6 +15,7 @@ from utils.metrics import calculate_rouge_score
 from utils.data import prepare_sft_dataset, tokenize_dataset_stats
 from trainers.grpo import LangAwareGRPOTrainer
 from trainers.sft import SFTQAConfig, SFTQATrainer
+from trainers.sft.dro import LangDROScheduler
 # Local SDFT trainer (add trainers/sdft to path)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "trainers", "sdft"))
 from sdft import DistilTrainer
@@ -197,6 +198,15 @@ def run_training(
     lang_model: Optional[InferenceModel] = None,
     dynamic_lang_feedback: bool = False,
     rouge_score_threshold: float = 0.6,
+    # Adaptive Group DRO (SFT only)
+    dro_eta: float = 0.0,
+    dro_loss_beta: float = 0.9,
+    dro_rouge_beta: float = 0.5,
+    dro_rouge_weight: float = 0.5,
+    dro_min_weight: float = 0.2,
+    dro_max_weight: float = 5.0,
+    dro_init_score: float = 0.3,
+    dro_languages: Optional[list[str]] = None,
     # Optim / schedule
     seed: int = 42,
     learning_rate: float = 2e-5,
@@ -249,6 +259,10 @@ def run_training(
     rouge_eval_max_new_tokens: int = 256,
     rouge_eval_batch_size: int = 8,
     log_multilingual_rouge: bool = True,
+    eval_steps: int = 0,
+    push_to_hub: bool = False,
+    hub_model_id: Optional[str] = None,
+    hub_strategy: str = "every_save",
 ) -> Union[DistilTrainer, GRPOTrainer, Trainer]:
     """
     Build DistilConfig, attach optional epoch-save callback, run trainer.train().
@@ -432,8 +446,33 @@ def run_training(
             rouge_eval_batch_size=rouge_eval_batch_size,
             log_multilingual_rouge=log_multilingual_rouge,
             eval_strategy="steps" if sft_eval is not None else "no",
-            eval_steps=save_steps if sft_eval is not None else None,
+            eval_steps=(eval_steps or save_steps) if sft_eval is not None else None,
+            push_to_hub=push_to_hub,
+            hub_model_id=hub_model_id,
+            hub_strategy=hub_strategy,
+            dro_eta=dro_eta,
+            dro_loss_beta=dro_loss_beta,
+            dro_rouge_beta=dro_rouge_beta,
+            dro_rouge_weight=dro_rouge_weight,
+            dro_min_weight=dro_min_weight,
+            dro_max_weight=dro_max_weight,
+            dro_init_score=dro_init_score,
+            dro_languages=list(dro_languages or []),
         )
+        # Build the DRO scheduler when eta > 0
+        dro_scheduler: Optional[LangDROScheduler] = None
+        if dro_eta > 0.0:
+            seed_langs = list(dro_languages or [])
+            dro_scheduler = LangDROScheduler(
+                languages=seed_langs if seed_langs else None,
+                eta=dro_eta,
+                loss_beta=dro_loss_beta,
+                rouge_beta=dro_rouge_beta,
+                rouge_weight=dro_rouge_weight,
+                min_weight=dro_min_weight,
+                max_weight=dro_max_weight,
+                init_score=dro_init_score,
+            )
         trainer = SFTQATrainer(
             model=student,
             args=sft_config,
@@ -443,6 +482,7 @@ def run_training(
             peft_config=peft_config,
             callbacks=callbacks if callbacks else None,
             chat_template_kwargs=chat_template_kwargs,
+            dro_scheduler=dro_scheduler,
         )
     else:
         config = DistilConfig(

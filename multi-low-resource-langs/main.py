@@ -147,6 +147,12 @@ def parse_args():
     p.add_argument("--logging_steps", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument(
+        "--eval_steps",
+        type=int,
+        default=450,
+        help="SFT: run eval-loss every N steps (0 = same as save_steps)",
+    )
+    p.add_argument(
         "--save_total_limit",
         type=int,
         default=3,
@@ -178,19 +184,19 @@ def parse_args():
     p.add_argument(
         "--rouge_eval_steps",
         type=int,
-        default=50,
+        default=100,
         help="SFT: run generation+ROUGE eval every N global steps",
     )
     p.add_argument(
         "--rouge_eval_num_samples",
         type=int,
-        default=100,
+        default=500,
         help="SFT: number of samples per ROUGE eval",
     )
     p.add_argument(
         "--rouge_eval_max_new_tokens",
         type=int,
-        default=256,
+        default=512,
         help="SFT: max new tokens when generating for ROUGE eval",
     )
     p.add_argument(
@@ -203,6 +209,66 @@ def parse_args():
         "--no_log_multilingual_rouge",
         action="store_true",
         help="SFT: disable per-language ROUGE breakdown (expected_lang)",
+    )
+
+    # Adaptive Group DRO
+    p.add_argument(
+        "--dro_eta",
+        type=float,
+        default=0.0,
+        help=(
+            "SFT: Group DRO sensitivity (0 disables DRO). "
+            "Higher values up-weight poorly-performing languages more aggressively. "
+            "Recommended starting value: 2.0"
+        ),
+    )
+    p.add_argument(
+        "--dro_loss_beta",
+        type=float,
+        default=0.9,
+        help="SFT: DRO EMA smoothing for per-language training loss (updated every step; 0=no update, 1=no memory)",
+    )
+    p.add_argument(
+        "--dro_rouge_beta",
+        type=float,
+        default=0.5,
+        help="SFT: DRO EMA smoothing for per-language ROUGE scores (updated every rouge_eval_steps)",
+    )
+    p.add_argument(
+        "--dro_rouge_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "SFT: blend factor between loss and ROUGE signals for DRO. "
+            "0.0 = loss only (high-frequency, zero-cost), "
+            "1.0 = ROUGE only (low-frequency, competition metric), "
+            "0.5 = equal blend (recommended)"
+        ),
+    )
+    p.add_argument(
+        "--dro_min_weight",
+        type=float,
+        default=0.2,
+        help="SFT: DRO minimum per-language loss weight (prevents language starvation)",
+    )
+    p.add_argument(
+        "--dro_max_weight",
+        type=float,
+        default=5.0,
+        help="SFT: DRO maximum per-language loss weight (prevents one language dominating)",
+    )
+    p.add_argument(
+        "--dro_init_score",
+        type=float,
+        default=0.3,
+        help="SFT: assumed ROUGE score per language before the first eval (neutral prior)",
+    )
+    p.add_argument(
+        "--dro_languages",
+        nargs="*",
+        default=None,
+        metavar="LANG",
+        help="SFT: seed language codes for DRO (e.g. Eng Aka Lug Amh Swa). Auto-discovered if omitted.",
     )
 
     # PEFT
@@ -234,6 +300,22 @@ def parse_args():
             "Sub-folder inside the HF repo to push to (default: repo root). "
             "E.g. 'runs/sft-v1' will upload output_dir contents to that path."
         ),
+    )
+    p.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        help="SFT: push checkpoints to HF Hub at every save_steps (uses HF_TOKEN + HF_REPO_ID env vars, or --hub_model_id)",
+    )
+    p.add_argument(
+        "--hub_model_id",
+        default=None,
+        help="SFT: HF repo id to push to (e.g. 'username/my-model'). Falls back to HF_REPO_ID env var.",
+    )
+    p.add_argument(
+        "--hub_strategy",
+        default="every_save",
+        choices=["end", "every_save", "checkpoint", "all_checkpoints"],
+        help="SFT: when to push to Hub (default: every_save = at every checkpoint)",
     )
 
     return p.parse_args()
@@ -374,6 +456,18 @@ def main():
         rouge_eval_max_new_tokens=args.rouge_eval_max_new_tokens,
         rouge_eval_batch_size=args.rouge_eval_batch_size,
         log_multilingual_rouge=not args.no_log_multilingual_rouge,
+        dro_eta=args.dro_eta,
+        dro_loss_beta=args.dro_loss_beta,
+        dro_rouge_beta=args.dro_rouge_beta,
+        dro_rouge_weight=args.dro_rouge_weight,
+        dro_min_weight=args.dro_min_weight,
+        dro_max_weight=args.dro_max_weight,
+        dro_init_score=args.dro_init_score,
+        dro_languages=args.dro_languages or [],
+        eval_steps=args.eval_steps or args.save_steps,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hub_model_id or os.getenv("HF_REPO_ID") or None,
+        hub_strategy=args.hub_strategy,
     )
 
     if args.upload_to_hf:

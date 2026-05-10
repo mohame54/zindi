@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from transformers import TrainerCallback
 from trl import SFTTrainer
 
@@ -12,6 +13,7 @@ from utils.metrics import calculate_rouge_score
 
 from trainers.sft.collator import SFTQACollator
 from trainers.sft.config import SFTQAConfig
+from trainers.sft.dro import LangDROScheduler
 
 
 def _print_rouge_report(
@@ -37,7 +39,11 @@ def _print_rouge_report(
 
 
 class RougeEvalCallback(TrainerCallback):
-    """Generation-based ROUGE on a fixed cadence; logs to W&B via ``trainer.log``."""
+    """Generation-based ROUGE on a fixed cadence; logs to W&B via ``trainer.log``.
+
+    If a ``LangDROScheduler`` is attached, per-language ROUGE scores are fed
+    into it after every eval so DRO weights are updated automatically.
+    """
 
     def __init__(
         self,
@@ -49,6 +55,7 @@ class RougeEvalCallback(TrainerCallback):
         log_multilingual_rouge: bool,
         rouge_eval_batch_size: int = 8,
         chat_template_kwargs: dict[str, Any] | None = None,
+        dro_scheduler: Optional[LangDROScheduler] = None,
     ) -> None:
         self.processing_class = processing_class
         self.rouge_raw_dataset = rouge_raw_dataset
@@ -58,6 +65,7 @@ class RougeEvalCallback(TrainerCallback):
         self.rouge_eval_batch_size = rouge_eval_batch_size
         self.log_multilingual_rouge = log_multilingual_rouge
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self.dro_scheduler = dro_scheduler
         self.trainer: Optional[SFTTrainer] = None
 
     def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
@@ -73,8 +81,35 @@ class RougeEvalCallback(TrainerCallback):
         if n == 0:
             return control
 
+        # ── Stratified sampling by language ──────────────────────────────────
+        # Build per-language index lists so every language gets a fair quota
+        # instead of random sampling that can leave rare languages out entirely.
+        lang_to_indices: dict[str, list[int]] = defaultdict(list)
+        has_lang = False
+        for i in range(n):
+            lang = ds[i].get("expected_lang")
+            if lang and str(lang).strip():
+                lang_to_indices[str(lang).strip()].append(i)
+                has_lang = True
+            else:
+                lang_to_indices["_unknown"].append(i)
+
         k = min(self.rouge_eval_num_samples, n)
-        indices = random.sample(range(n), k=k)
+        if has_lang and len(lang_to_indices) > 1:
+            num_langs = len(lang_to_indices)
+            per_lang_quota = max(1, k // num_langs)
+            indices: list[int] = []
+            for lang_idxs in lang_to_indices.values():
+                take = min(per_lang_quota, len(lang_idxs))
+                indices.extend(random.sample(lang_idxs, k=take))
+            # Top up from the remaining pool if we're under quota
+            if len(indices) < k:
+                picked = set(indices)
+                remaining = [i for i in range(n) if i not in picked]
+                extra = min(k - len(indices), len(remaining))
+                indices.extend(random.sample(remaining, k=extra))
+        else:
+            indices = random.sample(range(n), k=k)
 
         model = self.trainer.model
         was_training = model.training
@@ -92,10 +127,11 @@ class RougeEvalCallback(TrainerCallback):
         per_lang_scores: dict[str, list[dict[str, float]]] = defaultdict(list)
 
         rows = [ds[idx] for idx in indices]
+        actual_k = len(rows)
         batch_size = max(1, self.rouge_eval_batch_size)
 
         with torch.no_grad():
-            for batch_start in range(0, k, batch_size):
+            for batch_start in range(0, actual_k, batch_size):
                 batch_rows = rows[batch_start : batch_start + batch_size]
 
                 batch_prompt_ids = [
@@ -155,7 +191,7 @@ class RougeEvalCallback(TrainerCallback):
         if was_training:
             model.train()
 
-        inv_k = 1.0 / float(k)
+        inv_k = 1.0 / float(actual_k)
         overall = {
             "rouge/rouge1_f1": sum_r1 * inv_k,
             "rouge/rougeL_f1": sum_rl * inv_k,
@@ -164,6 +200,7 @@ class RougeEvalCallback(TrainerCallback):
 
         log_payload: dict[str, float] = dict(overall)
         per_lang_avg: dict[str, dict[str, float]] = {}
+        per_lang_rouge_scores: dict[str, float] = {}
 
         if self.log_multilingual_rouge and per_lang_scores:
             for lang, items in per_lang_scores.items():
@@ -179,9 +216,22 @@ class RougeEvalCallback(TrainerCallback):
                     "score": sc,
                     "count": float(c),
                 }
+                per_lang_rouge_scores[lang] = sc
                 log_payload[f"rouge/{lang}/rouge1_f1"] = r1
                 log_payload[f"rouge/{lang}/rougeL_f1"] = rl
                 log_payload[f"rouge/{lang}/score"] = sc
+
+        # ── Update DRO scheduler with ROUGE signal and log weights ───────────
+        if self.dro_scheduler is not None and per_lang_rouge_scores:
+            self.dro_scheduler.update_from_rouge(per_lang_rouge_scores)
+            for lang, w in self.dro_scheduler.weights().items():
+                log_payload[f"dro/weight/{lang}"] = w
+            for lang, s in self.dro_scheduler.rouge_scores().items():
+                log_payload[f"dro/ema_rouge/{lang}"] = s
+            for lang, s in self.dro_scheduler.loss_scores().items():
+                log_payload[f"dro/ema_loss_score/{lang}"] = s
+            for lang, s in self.dro_scheduler.blended_scores().items():
+                log_payload[f"dro/blended_score/{lang}"] = s
 
         self.trainer.log(log_payload)
 
@@ -200,11 +250,34 @@ class RougeEvalCallback(TrainerCallback):
             for lang, v in per_lang_avg.items()
         }
         _print_rouge_report(overall_flat, per_lang_report, int(state.global_step))
+
+        # ── Print DRO weight table if active ──────────────────────────────────
+        if self.dro_scheduler is not None:
+            print("\n=== DRO weights (after ROUGE update) ===")
+            print(f"{'Lang':<8} {'LossScore':>10} {'ROUGE EMA':>10} {'Blended':>9} {'Weight':>8}")
+            print("-" * 50)
+            wts = self.dro_scheduler.weights()
+            ls = self.dro_scheduler.loss_scores()
+            rs = self.dro_scheduler.rouge_scores()
+            bl = self.dro_scheduler.blended_scores()
+            for lang in sorted(wts):
+                print(
+                    f"{lang:<8} {ls.get(lang, 0.0):>10.4f} {rs.get(lang, 0.0):>10.4f}"
+                    f" {bl.get(lang, 0.0):>9.4f} {wts[lang]:>8.3f}"
+                )
+            print("-" * 50)
+
         return control
 
 
 class SFTQATrainer(SFTTrainer):
-    """TRL ``SFTTrainer`` with prompt-masked collator and ROUGE eval callback.
+    """TRL ``SFTTrainer`` with prompt-masked collator, ROUGE eval callback,
+    and optional adaptive Group DRO loss weighting.
+
+    When ``dro_scheduler`` is supplied, ``compute_loss`` applies per-sample
+    loss scaling based on the language weight from the scheduler.  The
+    ``RougeEvalCallback`` feeds ROUGE scores back into the scheduler after
+    every ROUGE eval step, closing the adaptive feedback loop.
 
     Inherits from ``trl.SFTTrainer`` for full TRL compatibility (peft_config
     handling, packing, dataset_text_field, etc.).  TRL's own dataset
@@ -222,7 +295,10 @@ class SFTQATrainer(SFTTrainer):
         peft_config: Any | None = None,
         callbacks: list[TrainerCallback] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        dro_scheduler: Optional[LangDROScheduler] = None,
     ) -> None:
+        self._dro_scheduler = dro_scheduler
+
         collator = SFTQACollator(
             processing_class,
             max_seq_length=args.max_length or 2048,
@@ -236,9 +312,10 @@ class SFTQATrainer(SFTTrainer):
             rouge_eval_steps=args.rouge_eval_steps,
             rouge_eval_num_samples=args.rouge_eval_num_samples,
             rouge_eval_max_new_tokens=args.rouge_eval_max_new_tokens,
-            rouge_eval_batch_size=args.rouge_eval_batch_size,
             log_multilingual_rouge=args.log_multilingual_rouge,
+            rouge_eval_batch_size=args.rouge_eval_batch_size,
             chat_template_kwargs=chat_template_kwargs,
+            dro_scheduler=dro_scheduler,
         )
 
         merged_callbacks = list(callbacks or []) + [rouge_cb]
@@ -254,6 +331,77 @@ class SFTQATrainer(SFTTrainer):
             callbacks=merged_callbacks,
         )
         rouge_cb.trainer = self
+
+    # ── Adaptive Group DRO loss ───────────────────────────────────────────────
+
+    def compute_loss(
+        self,
+        model: Any,
+        inputs: dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: Optional[int] = None,
+    ) -> Any:
+        # Pop the language list before forwarding to the model — it's not a
+        # tensor and the model doesn't expect it.
+        langs: list[str | None] | None = inputs.pop("expected_lang", None)
+
+        labels = inputs.get("labels")
+
+        if self._dro_scheduler is None or langs is None or labels is None:
+            # DRO disabled or language info absent — standard CE loss.
+            outputs = model(**inputs)
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        # ── DRO path: per-sample weighted cross-entropy ───────────────────────
+        outputs = model(**inputs)
+        logits = outputs.logits  # (B, T, V)
+
+        # Shift: predict token[t+1] from token[t]
+        shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
+        shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
+
+        # Token-level CE with no reduction — keep (B, T-1) shape
+        token_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(shift_labels.shape)
+
+        # Per-sample mean over non-masked tokens
+        valid = (shift_labels != -100).float()
+        denom = valid.sum(dim=-1).clamp(min=1.0)
+        per_sample_loss = (token_loss * valid).sum(dim=-1) / denom  # (B,)
+
+        # Look up DRO weight for each sample's language
+        weights = torch.tensor(
+            [
+                self._dro_scheduler.get_weight(str(lang)) if lang else 1.0
+                for lang in langs
+            ],
+            device=per_sample_loss.device,
+            dtype=per_sample_loss.dtype,
+        )
+
+        loss = (per_sample_loss * weights).mean()
+
+        # Feed per-language mean loss back into the scheduler (loss signal).
+        # This runs every step — no generation cost, high-frequency update.
+        per_lang_losses: dict[str, list[float]] = {}
+        detached = per_sample_loss.detach().float()
+        for lang, sample_loss in zip(langs, detached.tolist()):
+            if lang:
+                key = str(lang)
+                per_lang_losses.setdefault(key, []).append(sample_loss)
+        if per_lang_losses:
+            self._dro_scheduler.update_from_loss(
+                {lang: sum(vs) / len(vs) for lang, vs in per_lang_losses.items()}
+            )
+
+        return (loss, outputs) if return_outputs else loss
+
+    # ── TRL dataset preparation passthrough ──────────────────────────────────
 
     def _prepare_dataset(
         self,

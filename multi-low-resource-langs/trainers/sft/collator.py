@@ -76,8 +76,14 @@ class SFTQACollator:
             padded_labels.append(lab + [-100] * pad_amt)
             attention_mask.append([1] * len(ids) + [0] * pad_amt)
 
-        return {
+        batch: dict = {
             "input_ids": torch.tensor(padded_input, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(padded_labels, dtype=torch.long),
         }
+        # Pass language tags as a plain Python list (not a tensor) so that
+        # SFTQATrainer.compute_loss can apply per-language DRO weights.
+        langs = [feat.get("expected_lang") for feat in features]
+        if any(lang is not None for lang in langs):
+            batch["expected_lang"] = langs
+        return batch
