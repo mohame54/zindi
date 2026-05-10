@@ -9,26 +9,36 @@ import json
 # system prefixes when DistilTrainer compares logits on the same completion.
 SYSTEM_PROMPT = (
     "You are a helpful assistant. Follow the user's message. "
-    "If it includes a reference answer, use it to ground your response; do not copy it verbatim "
     "when you can say the same thing more naturally. "
-    "Answer in the same language as the user's question. "
+    "Answer in the language of the user's question. "
     "Reply with ONLY the final answer text. No thinking, no intro, no outro."
 )
 
+STUDENT_TEMPLATE = """\
+Answer in {language}
+Question:
+{question}"""
+
 TEACHER_TEMPLATE = """\
+Answer in {language}
 Question:
 {question}
 
-Reference answer (teacher context):
-{golden_answer}
-
-Write the final answer only, in the same language as the question."""
+Reference answer (use it to ground your response):
+{golden_answer}"""
 
 
-def create_student_messages(question: str, system_prompt: str = SYSTEM_PROMPT) -> list[dict]:
+def create_student_messages(
+    question: str,
+    *,
+    language: str = "",
+    system_prompt: str = SYSTEM_PROMPT,
+    student_template: str = STUDENT_TEMPLATE,
+) -> list[dict]:
+    content = student_template.format(question=question, language=language) if language else question
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": question},
+        {"role": "user", "content": content},
     ]
 
 
@@ -36,12 +46,12 @@ def create_teacher_messages(
     question: str,
     *,
     golden_answer: str | None = None,
+    language: str = "",
     system_prompt: str = SYSTEM_PROMPT,
     teacher_template: str = TEACHER_TEMPLATE,
 ) -> list[dict]:
     messages = [
         {"role": "system", "content": system_prompt},
-      
     ]
     if golden_answer is not None:
         messages.append({
@@ -49,6 +59,7 @@ def create_teacher_messages(
             "content": teacher_template.format(
                 question=question,
                 golden_answer=golden_answer,
+                language=language,
             ),
         })
     else:
@@ -62,6 +73,7 @@ def create_teacher_messages(
 def load_hf_sdft_data_from_csv(
     path: str,
     system_prompt: str = SYSTEM_PROMPT,
+    student_template: str = STUDENT_TEMPLATE,
     teacher_template: str = TEACHER_TEMPLATE,
     train: bool = True,
 ) -> pd.DataFrame:
@@ -72,13 +84,19 @@ def load_hf_sdft_data_from_csv(
     # SDFT: student prompt = question only; teacher_prompt = question + gold answer.
     # Separate list objects so online patching of teacher_prompt never mutates prompt.
     df['prompt'] = df.apply(
-        lambda r: create_student_messages(r['input'], system_prompt=system_prompt),
+        lambda r: create_student_messages(
+            r['input'],
+            language=r['expected_lang'],
+            system_prompt=system_prompt,
+            student_template=student_template,
+        ),
         axis=1,
     )
     df['teacher_prompt'] = df.apply(
         lambda r: create_teacher_messages(
             r['input'],
             golden_answer=r['output'],
+            language=r['expected_lang'],
             system_prompt=system_prompt,
             teacher_template=teacher_template,
         ),
