@@ -15,6 +15,9 @@ from trainers.sft.collator import SFTQACollator
 from trainers.sft.config import SFTQAConfig
 from trainers.sft.dro import LangDROScheduler
 
+# Sentinel so we can tell apart "not provided" from None in log()
+_MISSING = object()
+
 
 def _print_rouge_report(
     overall: dict[str, float],
@@ -298,6 +301,8 @@ class SFTQATrainer(SFTTrainer):
         dro_scheduler: Optional[LangDROScheduler] = None,
     ) -> None:
         self._dro_scheduler = dro_scheduler
+        # Accumulates per-step metrics between logging events; drained in log()
+        self._step_metrics: dict[str, list[float]] = defaultdict(list)
 
         collator = SFTQACollator(
             processing_class,
@@ -332,7 +337,7 @@ class SFTQATrainer(SFTTrainer):
         )
         rouge_cb.trainer = self
 
-    # ── Adaptive Group DRO loss ───────────────────────────────────────────────
+    # ── Per-step metrics: raw loss, accuracy, DRO ────────────────────────────
 
     def compute_loss(
         self,
@@ -341,65 +346,96 @@ class SFTQATrainer(SFTTrainer):
         return_outputs: bool = False,
         num_items_in_batch: Optional[int] = None,
     ) -> Any:
-        # Pop the language list before forwarding to the model — it's not a
-        # tensor and the model doesn't expect it.
+        # ── Strip TRL-internal and non-model keys from inputs ─────────────────
+        # TRL's prediction_step injects _prediction_loss_only into inputs before
+        # calling compute_loss. The model doesn't accept it → TypeError if not removed.
+        inputs.pop("_prediction_loss_only", None)
+
+        # Pop our language list — plain Python strings, not a tensor.
         langs: list[str | None] | None = inputs.pop("expected_lang", None)
+
+        # Disable KV-cache during training (matches TRL's own compute_loss behaviour).
+        # Required when gradient checkpointing is enabled; harmless otherwise.
+        inputs["use_cache"] = False
 
         labels = inputs.get("labels")
 
-        if self._dro_scheduler is None or langs is None or labels is None:
-            # DRO disabled or language info absent — standard CE loss.
-            outputs = model(**inputs)
-            loss = outputs.loss
-            return (loss, outputs) if return_outputs else loss
-
-        # ── DRO path: per-sample weighted cross-entropy ───────────────────────
         outputs = model(**inputs)
+
+        # If labels are absent (e.g. pure generation forward) fall through to
+        # the model's own loss (no accuracy, no DRO possible).
+        if labels is None:
+            return (outputs.loss, outputs) if return_outputs else outputs.loss
+
         logits = outputs.logits  # (B, T, V)
 
-        # Shift: predict token[t+1] from token[t]
-        shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
-        shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
+        # ── Manual per-token CE so we can compute per-sample loss + accuracy ─
+        # Shift: predict token[t+1] from hidden state at token[t].
+        shift_logits = logits[..., :-1, :].contiguous()  # (B, T-1, V)
+        shift_labels = labels[..., 1:].contiguous()       # (B, T-1)
 
-        # Token-level CE with no reduction — keep (B, T-1) shape
         token_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             reduction="none",
             ignore_index=-100,
-        ).view(shift_labels.shape)
+        ).view(shift_labels.shape)  # (B, T-1)
 
-        # Per-sample mean over non-masked tokens
-        valid = (shift_labels != -100).float()
-        denom = valid.sum(dim=-1).clamp(min=1.0)
-        per_sample_loss = (token_loss * valid).sum(dim=-1) / denom  # (B,)
+        valid = (shift_labels != -100).float()                    # (B, T-1)
+        n_valid = valid.sum(dim=-1).clamp(min=1.0)                # (B,)
+        per_sample_loss = (token_loss * valid).sum(dim=-1) / n_valid  # (B,)
+        raw_loss = per_sample_loss.mean()
 
-        # Look up DRO weight for each sample's language
-        weights = torch.tensor(
-            [
-                self._dro_scheduler.get_weight(str(lang)) if lang else 1.0
-                for lang in langs
-            ],
-            device=per_sample_loss.device,
-            dtype=per_sample_loss.dtype,
-        )
+        # ── Token accuracy (no grad needed) ──────────────────────────────────
+        with torch.no_grad():
+            preds = shift_logits.argmax(dim=-1)               # (B, T-1)
+            correct = (preds == shift_labels).float() * valid
+            accuracy = correct.sum() / valid.sum().clamp(min=1.0)
 
-        loss = (per_sample_loss * weights).mean()
-
-        # Feed per-language mean loss back into the scheduler (loss signal).
-        # This runs every step — no generation cost, high-frequency update.
-        per_lang_losses: dict[str, list[float]] = {}
-        detached = per_sample_loss.detach().float()
-        for lang, sample_loss in zip(langs, detached.tolist()):
-            if lang:
-                key = str(lang)
-                per_lang_losses.setdefault(key, []).append(sample_loss)
-        if per_lang_losses:
-            self._dro_scheduler.update_from_loss(
-                {lang: sum(vs) / len(vs) for lang, vs in per_lang_losses.items()}
+        # ── DRO weighting ─────────────────────────────────────────────────────
+        if self._dro_scheduler is not None and langs is not None:
+            weights = torch.tensor(
+                [self._dro_scheduler.get_weight(str(l)) if l else 1.0 for l in langs],
+                device=per_sample_loss.device,
+                dtype=per_sample_loss.dtype,
             )
+            loss = (per_sample_loss * weights).mean()
+
+            # Feed raw (unweighted) per-language losses back to the scheduler
+            # every step — zero overhead, high-frequency signal.
+            detached = per_sample_loss.detach().float()
+            per_lang_losses: dict[str, list[float]] = {}
+            for lang, sl in zip(langs, detached.tolist()):
+                if lang:
+                    per_lang_losses.setdefault(str(lang), []).append(sl)
+            if per_lang_losses:
+                self._dro_scheduler.update_from_loss(
+                    {lg: sum(vs) / len(vs) for lg, vs in per_lang_losses.items()}
+                )
+
+            # Log DRO-specific metrics
+            self._step_metrics["dro/weighted_loss"].append(loss.detach().item())
+            self._step_metrics["dro/mean_weight"].append(weights.mean().item())
+        else:
+            loss = raw_loss
+
+        # ── Accumulate interpretable metrics for log() ────────────────────────
+        self._step_metrics["raw_loss"].append(raw_loss.detach().item())
+        self._step_metrics["mean_token_accuracy"].append(accuracy.item())
 
         return (loss, outputs) if return_outputs else loss
+
+    # ── Drain per-step metric buffer into every log event ────────────────────
+
+    def log(self, logs: dict, start_time: Any = _MISSING) -> None:
+        if self._step_metrics:
+            for key, values in self._step_metrics.items():
+                logs[key] = round(sum(values) / len(values), 6)
+            self._step_metrics.clear()
+        if start_time is _MISSING:
+            super().log(logs)
+        else:
+            super().log(logs, start_time)
 
     # ── TRL dataset preparation passthrough ──────────────────────────────────
 
