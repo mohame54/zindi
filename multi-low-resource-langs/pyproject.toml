@@ -13,6 +13,5 @@ dependencies = [
     "scikit-learn>=1.6.1",
     "scipy>=1.14.0",
     "torch>=2.8.0",
-    "transformers>=5.0.0",
-    "trl>=0.24.0",
+    "transformers>=5.0.0"
 ]
