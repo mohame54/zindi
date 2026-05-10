@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 from datasets import Dataset
 import json
+import os
+import gdown
 
 
 # Shared by student and teacher so the system-role tokens match; only the user message differs
@@ -26,6 +28,80 @@ Question:
 
 Reference answer (use it to ground your response):
 {golden_answer}"""
+
+
+to_replace = """assistant
+<think>
+
+</think>
+"""
+
+def strip_qwen_thinking_tokens(text: str) -> str:
+    text = text.replace(to_replace, "")
+    return text.strip()
+
+def create_question(
+    question: str,
+    tokenizer,
+    language: str = "",
+    system_prompt: str = SYSTEM_PROMPT,
+    student_template: str = STUDENT_TEMPLATE,
+    tokenize:bool = True,
+    return_tensors: bool = "pt"
+) -> list[dict]:
+    
+
+    kwargs = {
+        "tokenize":tokenize,
+        "return_tensors":return_tensors
+    }
+    kwargs = {k:v for k,v in kwargs.items() if v is not None}
+    content = student_template.format(question=question, language=language) if language else question
+    inputs =  tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        enable_thinking = False,
+        **kwargs
+    )
+    return inputs
+
+def batch_create_question(
+    questions: list[str],
+    tokenizer,
+    language: list[str] | str = "",
+    system_prompt: str = SYSTEM_PROMPT,
+    student_template: str = STUDENT_TEMPLATE,
+) -> dict:
+    # Normalise language to a per-question list
+    if isinstance(language, str):
+        languages = [language] * len(questions)
+    else:
+        languages = language
+
+    # Apply chat template per conversation → plain strings first
+    formatted_texts = []
+    for qs, lang in zip(questions, languages):
+        text = create_question(
+            qs,
+            tokenizer,
+            language=lang,
+            system_prompt=system_prompt,
+            student_template=student_template,
+            return_tensors=None,
+            tokenize=False
+        )
+        formatted_texts.append(text)
+    # Batch-tokenize with left-padding (required for generation)
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(
+        formatted_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    )
+    return inputs   
 
 
 def create_student_messages(
@@ -204,3 +280,9 @@ def _print_stats_report(report: dict, question_col: str, answer_col: str) -> Non
         a_val = report["answers"][row]
         print(f"{row:<{col_width}} {str(q_val):>{col_width}} {str(a_val):>{col_width}}")
     print(separator)
+
+
+def download_gdown_file(file_id: str, output_path: str, quiet: bool = False) -> None:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    gdown.download(f"https://drive.google.com/uc?id={file_id}", output_path, quiet=quiet)
+    return output_path

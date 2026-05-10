@@ -53,6 +53,7 @@ def make_peft_model(
 def load_lora_model(
     model_name,
     logs=True,
+    from_peft_model=False,
 ):
     """Load a causal LM in bfloat16 and return (model, LoraConfig).
 
@@ -61,9 +62,13 @@ def load_lora_model(
     which handles FSDP / DeepSpeed setup correctly.
     """
     from transformers import AutoModelForCausalLM
+    from peft import AutoPeftModelForCausalLM
     peft_config = load_json(_DEFAULT_PEFT_CONFIG)
     dt = torch.bfloat16 if check_bfloat16_support() else torch.float16
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dt)
+    if from_peft_model:
+        model = AutoPeftModelForCausalLM.from_pretrained(model_name).cuda()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dt)
     lora_config = LoraConfig(**peft_config)
     if logs:
         print(f"Loaded LoRA model: {model_name}")
@@ -75,6 +80,7 @@ def load_qlora_model(
     bnb_4bit_quant_type="nf4",
     use_double_quant=True,
     logs=True,
+    from_peft_model=False,
 ):
     """Load a causal LM in 4-bit NF4 (QLoRA) and return (model, LoraConfig).
 
@@ -86,6 +92,7 @@ def load_qlora_model(
     """
     import os as _os
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from peft import AutoPeftModelForCausalLM
     from peft import prepare_model_for_kbit_training
 
     # device_map="auto" (model parallelism) is incompatible with multi-process
@@ -103,7 +110,10 @@ def load_qlora_model(
         bnb_4bit_use_double_quant=use_double_quant,
         bnb_4bit_quant_type=bnb_4bit_quant_type,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    if from_peft_model:
+        model = AutoPeftModelForCausalLM.from_pretrained(model_name).cuda()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
         model_name, quantization_config=bnb_config, device_map=_device_map
     )
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)

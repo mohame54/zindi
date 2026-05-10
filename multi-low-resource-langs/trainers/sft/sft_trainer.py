@@ -10,11 +10,11 @@ from transformers import TrainerCallback
 from trl import SFTTrainer
 
 from utils.metrics import calculate_rouge_score
-
+from utils.data import load_json
 from trainers.sft.collator import SFTQACollator
 from trainers.sft.config import SFTQAConfig
 from trainers.sft.dro import LangDROScheduler
-
+from utils.data import strip_qwen_thinking_tokens
 # Sentinel so we can tell apart "not provided" from None in log()
 _MISSING = object()
 
@@ -132,7 +132,7 @@ class RougeEvalCallback(TrainerCallback):
         rows = [ds[idx] for idx in indices]
         actual_k = len(rows)
         batch_size = max(1, self.rouge_eval_batch_size)
-
+        gen_kwargs = load_json("configs/gen_kwargs.json")
         with torch.no_grad():
             for batch_start in range(0, actual_k, batch_size):
                 batch_rows = rows[batch_start : batch_start + batch_size]
@@ -161,14 +161,14 @@ class RougeEvalCallback(TrainerCallback):
 
                 input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
                 attn = torch.tensor(attn_masks, dtype=torch.long, device=device)
-
+                
                 gen_out = model.generate(
                     input_ids,
                     attention_mask=attn,
                     max_new_tokens=self.rouge_eval_max_new_tokens,
                     pad_token_id=pad_id,
-                    do_sample=False,
-                    repetition_penalty=1.1,
+                    do_sample=True,
+                    **gen_kwargs,
                 )
 
                 for i, row in enumerate(batch_rows):
@@ -176,7 +176,7 @@ class RougeEvalCallback(TrainerCallback):
                     exp_lang = row.get("expected_lang")
                     new_tokens = gen_out[i, max_prompt_len:]
                     pred = tok.decode(new_tokens, skip_special_tokens=True).strip()
-
+                    pred = strip_qwen_thinking_tokens(pred)
                     scores = calculate_rouge_score(str(answer), pred)
                     sum_r1 += float(scores["rouge1_f1"])
                     sum_rl += float(scores["rougeL_f1"])
@@ -422,6 +422,11 @@ class SFTQATrainer(SFTTrainer):
         # ── Accumulate interpretable metrics for log() ────────────────────────
         self._step_metrics["raw_loss"].append(raw_loss.detach().item())
         self._step_metrics["mean_token_accuracy"].append(accuracy.item())
+
+        # Transformers ≥ 4.46 skips the grad-accum division in training_step
+        # when num_items_in_batch is provided, expecting compute_loss to own it.
+        if num_items_in_batch is not None:
+            loss = loss / self.args.gradient_accumulation_steps
 
         return (loss, outputs) if return_outputs else loss
 

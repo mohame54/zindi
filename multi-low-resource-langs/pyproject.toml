@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=3.0.0",
+    "gdown>=6.0.0",
     "matplotlib>=3.9.4",
     "pandas>=2.3.3",
     "peft>=0.14.0",
@@ -13,5 +14,6 @@ dependencies = [
     "scikit-learn>=1.6.1",
     "scipy>=1.14.0",
     "torch>=2.8.0",
-    "transformers>=5.0.0"
+    "transformers>=5.0.0",
+    "trl>=1.4.0",
 ]
