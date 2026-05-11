@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import pandas as pd
 from datasets import Dataset
@@ -30,14 +31,9 @@ Reference answer (use it to ground your response):
 {golden_answer}"""
 
 
-to_replace = """assistant
-<think>
-
-</think>
-"""
-
 def strip_qwen_thinking_tokens(text: str) -> str:
-    text = text.replace(to_replace, "")
+    # Remove optional "assistant" prefix, then any <think>...</think> block (and its content)
+    text = re.sub(r'^assistant\s*<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     return text.strip()
 
 def create_question(
@@ -186,10 +182,16 @@ def load_hf_sdft_data_from_csv(
     return Dataset.from_pandas(df)
 
 
+NO_THINK_PREFIX = "<think>\n\n</think>\n\n"
+
+
 def prepare_sft_dataset(dataset: Dataset, tokenizer, max_length: int = 1024) -> Dataset:
     def _add_messages(sample: dict) -> dict:
+        # Prefix the assistant turn with an empty think block so the model
+        # learns to output <think>\n\n</think> in non-thinking mode, matching
+        # what enable_thinking=False pre-fills at inference time.
         sample["messages"] = sample["prompt"] + [
-            {"role": "assistant", "content": sample["answer"]},
+            {"role": "assistant", "content": NO_THINK_PREFIX + sample["answer"]},
         ]
         return sample
     def length(messages):

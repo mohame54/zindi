@@ -168,6 +168,7 @@ class RougeEvalCallback(TrainerCallback):
                     max_new_tokens=self.rouge_eval_max_new_tokens,
                     pad_token_id=pad_id,
                     do_sample=True,
+                    suppress_tokens=[248068],  # block <think> re-generation
                     **gen_kwargs,
                 )
 

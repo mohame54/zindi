@@ -35,12 +35,19 @@ class SFTQACollator:
                 return_dict=False,
                 **self.chat_template_kwargs,
             )
+            # Exclude enable_thinking from prompt_ids: the thinking prefix
+            # (<think>\n\n</think>) lives in the assistant content and must be
+            # part of the supervised labels, not silently masked as prompt.
+            prompt_kwargs = {
+                k: v for k, v in self.chat_template_kwargs.items()
+                if k != "enable_thinking"
+            }
             prompt_ids = self.processing_class.apply_chat_template(
                 prompt,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=False,
-                **self.chat_template_kwargs,
+                **prompt_kwargs,
             )
 
             orig_prompt_len = len(prompt_ids)

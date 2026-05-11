@@ -1,5 +1,7 @@
 import argparse
+import logging
 import os
+import warnings
 
 import tqdm
 import pandas as pd
@@ -17,9 +19,26 @@ from utils.data import (
 from utils.metrics import calculate_rouge_score
 
 
+# Route warnings and transformer/accelerate logs through tqdm.write so they
+# don't break the progress bar.
+class _TqdmLoggingHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        tqdm.tqdm.write(self.format(record))
+
+
+logging.basicConfig(handlers=[_TqdmLoggingHandler()], level=logging.WARNING, force=True)
+warnings.showwarning = lambda msg, *a, **kw: tqdm.tqdm.write(f"Warning: {msg}")
+
+# Suppress verbose info-level messages from transformers (e.g. pad_token_id notices)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Generation
 # ──────────────────────────────────────────────────────────────────────────────
+
+_THINK_TOKEN_ID = 248068   # Qwen3 <think> token — suppress to block re-generation
+
 
 @torch.inference_mode()
 def generate_answer(
@@ -51,9 +70,9 @@ def generate_answer(
         top_k=top_k,
         min_p=min_p,
         repetition_penalty=repetition_penalty,
-        presence_penalty=presence_penalty,
         num_return_sequences=num_return_sequences,
         do_sample=True,
+        suppress_tokens=[_THINK_TOKEN_ID],
     )
     # batch_decode returns one string per sequence in the batch
     return tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
@@ -193,25 +212,42 @@ def main(args: argparse.Namespace) -> None:
     mode        = args.mode
     batch_size  = args.batch_size
     df          = pd.read_csv(dataset_path)
+    df['lang'] = df['subset'].apply(lambda x: x.split("_")[0])
     to_save_path = args.to_save_path or os.path.join(os.path.dirname(args.data_csv_path), f"{args.mode}_results.csv")
+    if to_save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(to_save_path)), exist_ok=True)
 
-    labels         = ["TargetLLM", "TargetR1F1", "TargetRLF1"]
+    labels         = [ "TargetRLF1", "TargetR1F1", "TargetLLM"]
     data: list[dict] = []
+
+    # Placeholder used when generation fails or produces an empty string.
+    # A non-empty string prevents the CSV round-trip ""→NaN bug (pandas read_csv
+    # converts empty cells to NaN by default).
+    _FALLBACK_ANSWER = "I am unable to provide an answer to this question at this time."
 
     for i in tqdm.tqdm(range(0, len(df), batch_size), desc="Generating"):
         batch       = df.iloc[i : i + batch_size]
         qs          = batch["input"].values.tolist()
         batch_langs = batch["lang"].values.tolist()
 
-        answers = generate_answer(
-            qs,
-            model,
-            tokenizer,
-            langs=batch_langs,
-            max_new_tokens=args.max_new_tokens,
-            **gen_kwargs,
-        )
-        answers = [strip_qwen_thinking_tokens(a) for a in answers]
+        # ── Safe generation: catch OOM / any runtime error per batch ──────────
+        try:
+            answers = generate_answer(
+                qs,
+                model,
+                tokenizer,
+                langs=batch_langs,
+                max_new_tokens=args.max_new_tokens,
+                **gen_kwargs,
+            )
+            answers = [strip_qwen_thinking_tokens(a) for a in answers]
+        except Exception as exc:
+            tqdm.tqdm.write(f"[WARNING] batch {i}–{i+batch_size} failed ({exc}); using fallback answers.")
+            answers = [_FALLBACK_ANSWER] * len(qs)
+
+        # Guard: replace any empty string (model produced only EOS/pad tokens)
+        # with the fallback so it never becomes NaN in the CSV round-trip.
+        answers = [a if a.strip() else _FALLBACK_ANSWER for a in answers]
 
         # Detect language of each generated answer
         detected_langs: list[str] | None = None

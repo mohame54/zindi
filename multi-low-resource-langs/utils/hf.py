@@ -3,9 +3,7 @@ from huggingface_hub import HfApi
 
 
 def load_hf_api():
-   from huggingface_hub.hf_api import HfFolder
-   HfFolder.save_token(os.getenv("HF_TOKEN"))
-   return HfApi()
+    return HfApi(token=os.getenv("HF_TOKEN"))
 
 
 def upload_file_paths_to_hf(pathes):

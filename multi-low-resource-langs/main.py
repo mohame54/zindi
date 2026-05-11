@@ -13,6 +13,7 @@ from train import run_training
 from utils.data import SYSTEM_PROMPT, TEACHER_TEMPLATE, load_hf_sdft_data_from_csv
 from utils.hf import download_checkpoint_from_hf, upload_folder_to_hf
 from utils import rewards as reward_mod
+from utils.data import download_gdown_file
 from langs import InferenceModel
 
 
@@ -86,7 +87,8 @@ def parse_args():
         default=16,
         help="Batch size for lang model torch.compile",
     )
-
+    p.add_argument("--gdrive_dataset_id", default=None)
+    p.add_argument("--gdrive_eval_dataset_id", default=None)
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--num_train_epochs", type=int, default=1)
     p.add_argument("--grad_accum_steps", type=int, default=32)
@@ -357,17 +359,18 @@ def main():
         if args.teacher_template_file
         else TEACHER_TEMPLATE
     )
-
+    dataset_path = download_gdown_file(args.gdrive_dataset_id, "data/Train.csv") if args.gdrive_dataset_id else args.dataset_path
     dataset = load_hf_sdft_data_from_csv(
-        args.dataset_path,
+        dataset_path,
         system_prompt=system_prompt,
         teacher_template=teacher_template,
     )
 
     eval_dataset = None
-    if args.eval_dataset_path:
+    if args.eval_dataset_path or args.gdrive_eval_dataset_id:
+        eval_dataset_path = download_gdown_file(args.gdrive_eval_dataset_id, "data/Test.csv") if args.gdrive_eval_dataset_id else args.eval_dataset_path
         eval_dataset = load_hf_sdft_data_from_csv(
-            args.eval_dataset_path,
+            eval_dataset_path,
             system_prompt=system_prompt,
             teacher_template=teacher_template,
             train=False,
