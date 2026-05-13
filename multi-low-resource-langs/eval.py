@@ -11,10 +11,11 @@ from transformers import AutoTokenizer
 from langs import InferenceModel
 from utils.peft import load_lora_model, load_qlora_model
 from utils.data import (
-  batch_create_question,
-  load_json,
-  strip_qwen_thinking_tokens,
-  download_gdown_file,
+    COUNTRY_MAP,
+    batch_create_question,
+    load_json,
+    strip_qwen_thinking_tokens,
+    download_gdown_file,
 )
 from utils.metrics import calculate_rouge_score
 
@@ -45,7 +46,8 @@ def generate_answer(
     questions: list[str],
     model,
     tokenizer,
-    langs,
+    langs: list[str],
+    countries: list[str] | None = None,
     max_new_tokens: int = 256,
     num_return_sequences: int = 1,
     temperature: float = 1.0,
@@ -56,7 +58,12 @@ def generate_answer(
     presence_penalty: float = 2.0,
 ) -> list[str]:
     torch.cuda.empty_cache()
-    inputs = batch_create_question(questions, tokenizer, language=langs)
+    inputs = batch_create_question(
+        questions,
+        tokenizer,
+        language=langs,
+        country=countries if countries is not None else "",
+    )
     prompt_len = int(inputs["input_ids"].size(1))
     dev = next(iter(model.parameters())).device
     inputs = {k: v.to(dev) for k, v in inputs.items()}
@@ -82,20 +89,60 @@ def generate_answer(
 # Evaluation report
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _col_width(values: list, header: str, min_w: int = 8) -> int:
-    return max(min_w, len(header), max((len(str(v)) for v in values), default=0))
+def _normalise_country(value) -> str:
+    if pd.isna(value):
+        return ""
+    value = str(value).strip()
+    return COUNTRY_MAP.get(value, value)
+
+
+def add_eval_prompt_columns(
+    df: pd.DataFrame,
+    country_override: str | None = None,
+) -> pd.DataFrame:
+    """Add normalized `lang` and `country` columns used by the eval prompt."""
+    df = df.copy()
+
+    subset_lang = pd.Series("", index=df.index)
+    subset_country_code = pd.Series("", index=df.index)
+    if "subset" in df.columns:
+        subset_parts = df["subset"].fillna("").astype(str).str.split("_", n=1, expand=True)
+        subset_lang = subset_parts[0].fillna("")
+        if 1 in subset_parts.columns:
+            subset_country_code = subset_parts[1].fillna("")
+
+    if "lang" in df.columns:
+        df["lang"] = df["lang"].fillna(subset_lang).astype(str)
+    elif "expected_lang" in df.columns:
+        df["lang"] = df["expected_lang"].fillna(subset_lang).astype(str)
+    else:
+        df["lang"] = subset_lang.astype(str)
+
+    if country_override is not None:
+        df["country"] = _normalise_country(country_override)
+    elif "country" in df.columns:
+        df["country"] = df["country"].map(_normalise_country)
+    elif "expected_country" in df.columns:
+        df["country"] = df["expected_country"].map(_normalise_country)
+    else:
+        df["country"] = subset_country_code.map(_normalise_country)
+
+    return df
+
+
+def _is_lang_correct(detected_lang: str, expected_lang: str) -> bool:
+    return str(detected_lang).strip().lower() == str(expected_lang).strip().lower()
 
 
 def print_eval_report(
     data: list[dict],
-    df_expected_langs: pd.Series | None,
     dataset_path: str,
 ) -> None:
     """Print a formatted evaluation report to stdout."""
     results_df = pd.DataFrame(data)
     n = len(results_df)
 
-    sep  = "=" * 65
+    sep = "=" * 65
     dash = "─" * 65
     print(f"\n{sep}")
     print("                    EVALUATION REPORT")
@@ -123,8 +170,6 @@ def print_eval_report(
         ].agg(["mean", "count"])
         # flatten MultiIndex columns → rouge1_f1_mean, rouge1_f1_count …
         grouped.columns = ["_".join(c) for c in grouped.columns]
-        n_col = grouped["rouge1_f1_count"].astype(int)
-
         lang_col_w = max(6, max(len(str(l)) for l in grouped.index))
         header = (
             f"  {'Lang':<{lang_col_w}}  {'rouge1_f1':>10}  "
@@ -142,28 +187,36 @@ def print_eval_report(
             )
 
     # ── Language fidelity ─────────────────────────────────────────────────────
-    if "detected_lang" in results_df.columns and df_expected_langs is not None:
+    if "detected_lang" in results_df.columns and "expected_lang" in results_df.columns:
         print(f"\n{dash}")
         print("  Language Fidelity  (detected vs expected)")
         print(dash)
 
-        results_df["lang_correct"] = (
-            results_df["detected_lang"].str.lower()
-            == results_df["expected_lang"].str.lower()
+        results_df["lang_correct"] = results_df.apply(
+            lambda row: _is_lang_correct(row["detected_lang"], row["expected_lang"]),
+            axis=1,
         )
         overall_acc = results_df["lang_correct"].mean()
-        n_correct   = results_df["lang_correct"].sum()
-        print(f"  Overall accuracy : {overall_acc:.1%}  ({n_correct} / {n})")
+        n_correct = int(results_df["lang_correct"].sum())
+        n_mismatch = int((~results_df["lang_correct"]).sum())
+        print(
+            f"  Overall accuracy : {overall_acc:.1%}  "
+            f"({n_correct} correct, {n_mismatch} mismatched / {n})"
+        )
 
-        print(f"\n  {'Lang':<12}  {'accuracy':>10}  {'correct':>8}  {'total':>6}")
-        print("  " + "─" * 42)
+        print(
+            f"\n  {'Lang':<12}  {'accuracy':>10}  "
+            f"{'correct':>8}  {'mismatched':>11}  {'total':>6}"
+        )
+        print("  " + "─" * 55)
         for lang, grp in results_df.groupby("expected_lang"):
-            acc     = grp["lang_correct"].mean()
-            correct = grp["lang_correct"].sum()
-            total   = len(grp)
+            acc        = grp["lang_correct"].mean()
+            correct    = int(grp["lang_correct"].sum())
+            mismatched = int((~grp["lang_correct"]).sum())
+            total      = len(grp)
             print(
                 f"  {str(lang):<12}  {acc:>10.1%}  "
-                f"{correct:>8}  {total:>6}"
+                f"{correct:>8}  {mismatched:>11}  {total:>6}"
             )
 
         # Confusion: expected → detected distribution
@@ -171,6 +224,11 @@ def print_eval_report(
         dist = results_df["detected_lang"].value_counts()
         for lang, cnt in dist.items():
             print(f"    {lang:<12} : {cnt:>5}  ({cnt/n:.1%})")
+    elif "expected_lang" in results_df.columns:
+        print(f"\n{dash}")
+        print("  Language Fidelity")
+        print(dash)
+        print("  Skipped: no generated languages were detected.")
 
     print(f"\n{sep}\n")
 
@@ -208,16 +266,18 @@ def main(args: argparse.Namespace) -> None:
             args.lang_model_ckpt, tokenizer_path=lang_tokenizer_path
         )
 
-    gen_kwargs  = load_json(args.gen_kwargs_path or "configs/gen_kwargs.json")
-    mode        = args.mode
-    batch_size  = args.batch_size
-    df          = pd.read_csv(dataset_path)
-    df['lang'] = df['subset'].apply(lambda x: x.split("_")[0])
-    to_save_path = args.to_save_path or os.path.join(os.path.dirname(args.data_csv_path), f"{args.mode}_results.csv")
+    gen_kwargs = load_json(args.gen_kwargs_path or "configs/gen_kwargs.json")
+    mode = args.mode
+    batch_size = args.batch_size
+    df = add_eval_prompt_columns(pd.read_csv(dataset_path), args.country)
+    to_save_path = args.to_save_path or os.path.join(
+        os.path.dirname(dataset_path),
+        f"{args.mode}_results.csv",
+    )
     if to_save_path:
         os.makedirs(os.path.dirname(os.path.abspath(to_save_path)), exist_ok=True)
 
-    labels         = [ "TargetRLF1", "TargetR1F1", "TargetLLM"]
+    labels = ["TargetRLF1", "TargetR1F1", "TargetLLM"]
     data: list[dict] = []
 
     # Placeholder used when generation fails or produces an empty string.
@@ -226,9 +286,10 @@ def main(args: argparse.Namespace) -> None:
     _FALLBACK_ANSWER = "I am unable to provide an answer to this question at this time."
 
     for i in tqdm.tqdm(range(0, len(df), batch_size), desc="Generating"):
-        batch       = df.iloc[i : i + batch_size]
-        qs          = batch["input"].values.tolist()
+        batch = df.iloc[i : i + batch_size]
+        qs = batch["input"].values.tolist()
         batch_langs = batch["lang"].values.tolist()
+        batch_countries = batch["country"].values.tolist()
 
         # ── Safe generation: catch OOM / any runtime error per batch ──────────
         try:
@@ -237,12 +298,16 @@ def main(args: argparse.Namespace) -> None:
                 model,
                 tokenizer,
                 langs=batch_langs,
+                countries=batch_countries,
                 max_new_tokens=args.max_new_tokens,
                 **gen_kwargs,
             )
             answers = [strip_qwen_thinking_tokens(a) for a in answers]
         except Exception as exc:
-            tqdm.tqdm.write(f"[WARNING] batch {i}–{i+batch_size} failed ({exc}); using fallback answers.")
+            tqdm.tqdm.write(
+                f"[WARNING] batch {i}–{i+batch_size} failed ({exc}); "
+                "using fallback answers."
+            )
             answers = [_FALLBACK_ANSWER] * len(qs)
 
         # Guard: replace any empty string (model produced only EOS/pad tokens)
@@ -256,10 +321,18 @@ def main(args: argparse.Namespace) -> None:
 
         if mode == "test":
             for j, (row_id, answer) in enumerate(zip(batch["ID"], answers)):
-                item: dict = {"ID": row_id, "expected_lang": batch_langs[j]}
+                item: dict = {
+                    "ID": row_id,
+                    "expected_lang": batch_langs[j],
+                    "expected_country": batch_countries[j],
+                }
                 item.update({lbl: answer for lbl in labels})
                 if detected_langs is not None:
                     item["detected_lang"] = detected_langs[j]
+                    item["lang_correct"] = _is_lang_correct(
+                        detected_langs[j],
+                        batch_langs[j],
+                    )
                 data.append(item)
 
         elif mode == "eval":
@@ -270,10 +343,15 @@ def main(args: argparse.Namespace) -> None:
                     "ID": row_id,
                     "gen_answer": gen_answer,
                     "expected_lang": batch_langs[j],
+                    "expected_country": batch_countries[j],
                 }
                 item.update(calculate_rouge_score(gold_answer, gen_answer))
                 if detected_langs is not None:
                     item["detected_lang"] = detected_langs[j]
+                    item["lang_correct"] = _is_lang_correct(
+                        detected_langs[j],
+                        batch_langs[j],
+                    )
                 data.append(item)
 
         else:
@@ -288,8 +366,7 @@ def main(args: argparse.Namespace) -> None:
     # ── Print evaluation report ───────────────────────────────────────────────
     print_eval_report(
         data,
-        df_expected_langs=df["lang"] if "lang" in df.columns else None,
-        dataset_path=args.data_csv_path,
+        dataset_path=dataset_path,
     )
 
     if to_save_path:
@@ -319,6 +396,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="CSV file with at least 'ID', 'input', 'lang' columns "
              "(and 'output' for eval mode).",
+    )
+    p.add_argument(
+        "--country",
+        default=None,
+        help="Optional country override for every prompt. If omitted, eval uses "
+             "a country/expected_country column or derives it from subset.",
     )
     p.add_argument(
         "--mode",

@@ -17,13 +17,21 @@ SYSTEM_PROMPT = (
     "Reply with ONLY the final answer text. No thinking, no intro, no outro."
 )
 
+# Maps the two-letter country code found in the subset ID to a full country name.
+COUNTRY_MAP: dict[str, str] = {
+    "Uga": "Uganda",
+    "Gha": "Ghana",
+    "Eth": "Ethiopia",
+    "Ken": "Kenya",
+}
+
 STUDENT_TEMPLATE = """\
-Answer in {language}
+Answer in {language} as spoken in {country}
 Question:
 {question}"""
 
 TEACHER_TEMPLATE = """\
-Answer in {language}
+Answer in {language} as spoken in {country}
 Question:
 {question}
 
@@ -40,19 +48,23 @@ def create_question(
     question: str,
     tokenizer,
     language: str = "",
+    country: str = "",
     system_prompt: str = SYSTEM_PROMPT,
     student_template: str = STUDENT_TEMPLATE,
     tokenize:bool = True,
     return_tensors: bool = "pt"
 ) -> list[dict]:
-    
 
     kwargs = {
         "tokenize":tokenize,
         "return_tensors":return_tensors
     }
     kwargs = {k:v for k,v in kwargs.items() if v is not None}
-    content = student_template.format(question=question, language=language) if language else question
+    content = (
+        student_template.format(question=question, language=language, country=country)
+        if language or country
+        else question
+    )
     inputs =  tokenizer.apply_chat_template(
         [
             {"role": "system", "content": system_prompt},
@@ -67,22 +79,29 @@ def batch_create_question(
     questions: list[str],
     tokenizer,
     language: list[str] | str = "",
+    country: list[str] | str = "",
     system_prompt: str = SYSTEM_PROMPT,
     student_template: str = STUDENT_TEMPLATE,
 ) -> dict:
-    # Normalise language to a per-question list
+    # Normalise language and country to per-question lists
     if isinstance(language, str):
         languages = [language] * len(questions)
     else:
         languages = language
 
+    if isinstance(country, str):
+        countries = [country] * len(questions)
+    else:
+        countries = country
+
     # Apply chat template per conversation → plain strings first
     formatted_texts = []
-    for qs, lang in zip(questions, languages):
+    for qs, lang, ctry in zip(questions, languages, countries):
         text = create_question(
             qs,
             tokenizer,
             language=lang,
+            country=ctry,
             system_prompt=system_prompt,
             student_template=student_template,
             return_tensors=None,
@@ -104,10 +123,15 @@ def create_student_messages(
     question: str,
     *,
     language: str = "",
+    country: str = "",
     system_prompt: str = SYSTEM_PROMPT,
     student_template: str = STUDENT_TEMPLATE,
 ) -> list[dict]:
-    content = student_template.format(question=question, language=language) if language else question
+    content = (
+        student_template.format(question=question, language=language, country=country)
+        if language or country
+        else question
+    )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},
@@ -119,6 +143,7 @@ def create_teacher_messages(
     *,
     golden_answer: str | None = None,
     language: str = "",
+    country: str = "",
     system_prompt: str = SYSTEM_PROMPT,
     teacher_template: str = TEACHER_TEMPLATE,
 ) -> list[dict]:
@@ -132,6 +157,7 @@ def create_teacher_messages(
                 question=question,
                 golden_answer=golden_answer,
                 language=language,
+                country=country,
             ),
         })
     else:
@@ -152,6 +178,7 @@ def load_hf_sdft_data_from_csv(
     df = pd.read_csv(path)
     old_cols = df.columns.tolist()
     df['expected_lang'] = df['subset'].str.split('_').str[0]
+    df['expected_country'] = df['subset'].str.split('_').str[1].map(COUNTRY_MAP).fillna("")
 
     # SDFT: student prompt = question only; teacher_prompt = question + gold answer.
     # Separate list objects so online patching of teacher_prompt never mutates prompt.
@@ -159,6 +186,7 @@ def load_hf_sdft_data_from_csv(
         lambda r: create_student_messages(
             r['input'],
             language=r['expected_lang'],
+            country=r['expected_country'],
             system_prompt=system_prompt,
             student_template=student_template,
         ),
@@ -169,6 +197,7 @@ def load_hf_sdft_data_from_csv(
             r['input'],
             golden_answer=r['output'],
             language=r['expected_lang'],
+            country=r['expected_country'],
             system_prompt=system_prompt,
             teacher_template=teacher_template,
         ),

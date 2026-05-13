@@ -224,19 +224,6 @@ class RougeEvalCallback(TrainerCallback):
                 log_payload[f"rouge/{lang}/rouge1_f1"] = r1
                 log_payload[f"rouge/{lang}/rougeL_f1"] = rl
                 log_payload[f"rouge/{lang}/score"] = sc
-
-        # ── Update DRO scheduler with ROUGE signal and log weights ───────────
-        if self.dro_scheduler is not None and per_lang_rouge_scores:
-            self.dro_scheduler.update_from_rouge(per_lang_rouge_scores)
-            for lang, w in self.dro_scheduler.weights().items():
-                log_payload[f"dro/weight/{lang}"] = w
-            for lang, s in self.dro_scheduler.rouge_scores().items():
-                log_payload[f"dro/ema_rouge/{lang}"] = s
-            for lang, s in self.dro_scheduler.loss_scores().items():
-                log_payload[f"dro/ema_loss_score/{lang}"] = s
-            for lang, s in self.dro_scheduler.blended_scores().items():
-                log_payload[f"dro/blended_score/{lang}"] = s
-
         self.trainer.log(log_payload)
 
         overall_flat = {
@@ -254,22 +241,6 @@ class RougeEvalCallback(TrainerCallback):
             for lang, v in per_lang_avg.items()
         }
         _print_rouge_report(overall_flat, per_lang_report, int(state.global_step))
-
-        # ── Print DRO weight table if active ──────────────────────────────────
-        if self.dro_scheduler is not None:
-            print("\n=== DRO weights (after ROUGE update) ===")
-            print(f"{'Lang':<8} {'LossScore':>10} {'ROUGE EMA':>10} {'Blended':>9} {'Weight':>8}")
-            print("-" * 50)
-            wts = self.dro_scheduler.weights()
-            ls = self.dro_scheduler.loss_scores()
-            rs = self.dro_scheduler.rouge_scores()
-            bl = self.dro_scheduler.blended_scores()
-            for lang in sorted(wts):
-                print(
-                    f"{lang:<8} {ls.get(lang, 0.0):>10.4f} {rs.get(lang, 0.0):>10.4f}"
-                    f" {bl.get(lang, 0.0):>9.4f} {wts[lang]:>8.3f}"
-                )
-            print("-" * 50)
 
         return control
 
@@ -352,8 +323,8 @@ class SFTQATrainer(SFTTrainer):
         # calling compute_loss. The model doesn't accept it → TypeError if not removed.
         inputs.pop("_prediction_loss_only", None)
 
-        # Pop our language list — plain Python strings, not a tensor.
-        langs: list[str | None] | None = inputs.pop("expected_lang", None)
+        # Pop non-model metadata before forwarding to the model.
+        inputs.pop("expected_lang", None)
 
         # Disable KV-cache during training (matches TRL's own compute_loss behaviour).
         # Required when gradient checkpointing is enabled; harmless otherwise.
@@ -370,55 +341,25 @@ class SFTQATrainer(SFTTrainer):
 
         logits = outputs.logits  # (B, T, V)
 
-        # ── Manual per-token CE so we can compute per-sample loss + accuracy ─
+        # ── Manual shifted CE so we can compute token accuracy ───────────────
         # Shift: predict token[t+1] from hidden state at token[t].
         shift_logits = logits[..., :-1, :].contiguous()  # (B, T-1, V)
         shift_labels = labels[..., 1:].contiguous()       # (B, T-1)
 
-        token_loss = F.cross_entropy(
+        raw_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-            reduction="none",
             ignore_index=-100,
-        ).view(shift_labels.shape)  # (B, T-1)
+        )
 
         valid = (shift_labels != -100).float()                    # (B, T-1)
-        n_valid = valid.sum(dim=-1).clamp(min=1.0)                # (B,)
-        per_sample_loss = (token_loss * valid).sum(dim=-1) / n_valid  # (B,)
-        raw_loss = per_sample_loss.mean()
+        loss = raw_loss
 
         # ── Token accuracy (no grad needed) ──────────────────────────────────
         with torch.no_grad():
             preds = shift_logits.argmax(dim=-1)               # (B, T-1)
             correct = (preds == shift_labels).float() * valid
             accuracy = correct.sum() / valid.sum().clamp(min=1.0)
-
-        # ── DRO weighting ─────────────────────────────────────────────────────
-        if self._dro_scheduler is not None and langs is not None:
-            weights = torch.tensor(
-                [self._dro_scheduler.get_weight(str(l)) if l else 1.0 for l in langs],
-                device=per_sample_loss.device,
-                dtype=per_sample_loss.dtype,
-            )
-            loss = (per_sample_loss * weights).mean()
-
-            # Feed raw (unweighted) per-language losses back to the scheduler
-            # every step — zero overhead, high-frequency signal.
-            detached = per_sample_loss.detach().float()
-            per_lang_losses: dict[str, list[float]] = {}
-            for lang, sl in zip(langs, detached.tolist()):
-                if lang:
-                    per_lang_losses.setdefault(str(lang), []).append(sl)
-            if per_lang_losses:
-                self._dro_scheduler.update_from_loss(
-                    {lg: sum(vs) / len(vs) for lg, vs in per_lang_losses.items()}
-                )
-
-            # Log DRO-specific metrics
-            self._step_metrics["dro/weighted_loss"].append(loss.detach().item())
-            self._step_metrics["dro/mean_weight"].append(weights.mean().item())
-        else:
-            loss = raw_loss
 
         # ── Accumulate interpretable metrics for log() ────────────────────────
         self._step_metrics["raw_loss"].append(raw_loss.detach().item())

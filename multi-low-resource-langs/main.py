@@ -180,7 +180,7 @@ def parse_args():
     p.add_argument(
         "--max_seq_length",
         type=int,
-        default=1024,
+        default=2048,
         help="SFT: max tokens per example (prompt + answer) after truncation",
     )
     p.add_argument(
@@ -359,7 +359,9 @@ def main():
         if args.teacher_template_file
         else TEACHER_TEMPLATE
     )
-    dataset_path = download_gdown_file(args.gdrive_dataset_id, "data/Train.csv") if args.gdrive_dataset_id else args.dataset_path
+    dataset_path = args.dataset_path
+    if args.gdrive_dataset_id:
+       dataset_path = download_gdown_file(args.gdrive_dataset_id, "data/Train.csv") if args.gdrive_dataset_id else args.dataset_path
     dataset = load_hf_sdft_data_from_csv(
         dataset_path,
         system_prompt=system_prompt,
@@ -368,7 +370,9 @@ def main():
 
     eval_dataset = None
     if args.eval_dataset_path or args.gdrive_eval_dataset_id:
-        eval_dataset_path = download_gdown_file(args.gdrive_eval_dataset_id, "data/Test.csv") if args.gdrive_eval_dataset_id else args.eval_dataset_path
+        eval_dataset_path = args.eval_dataset_path
+        if args.gdrive_eval_dataset_id:
+            eval_dataset_path = download_gdown_file(args.gdrive_eval_dataset_id, "data/Test.csv") if args.gdrive_eval_dataset_id else args.eval_dataset_path
         eval_dataset = load_hf_sdft_data_from_csv(
             eval_dataset_path,
             system_prompt=system_prompt,
